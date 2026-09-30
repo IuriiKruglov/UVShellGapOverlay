@@ -2,7 +2,7 @@
 
 A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
 
-**Version:** 1.3.0 · **Blender:** 3.6 LTS to 5.2 LTS · **Authors:** Iurii Kruglov & Claude (Anthropic) · **License:** GPL-3.0-or-later
+**Version:** 1.3.0 · **Blender:** 3.6 LTS to 5.2 LTS · **License:** GPL-3.0-or-later
 
 ---
 
@@ -281,9 +281,7 @@ For very large layouts, lower *Points per Shell*: the gap measurement grows with
 
 ---
 
-## Authors
 
-Iurii Kruglov & Claude (Anthropic)
 
 ## License
 
