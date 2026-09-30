@@ -1,13 +1,8 @@
-<a href="https://www.youtube.com/watch?v=52zzfMgj1C8">
-  <img width="50%" alt="UVShell_Gap_1" src="https://github.com/user-attachments/assets/08949696-df58-4a27-b3a1-f256382ebb11" />
-</a>
-
-
-
 # UV Shell Gap Overlay
 
-A Blender add-on for the UV Editor that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, and how far shells sit from their UDIM tile border. Every measurement is color-graded against the padding you need. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
+A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
 
+**Version:** 1.3.0 · **Blender:** 3.6 LTS to 5.2 LTS · **Authors:** Iurii Kruglov & Claude (Anthropic) · **License:** GPL-3.0-or-later
 
 ---
 
@@ -18,8 +13,10 @@ A Blender add-on for the UV Editor that shows, directly on your UV layout, how m
 - **Overlap detection.** Points that fall inside another shell are labeled **Overlap**. Overlapping shell pairs are also found between the points: crossing borders, a shell inside another, stacked or mirrored duplicates.
 - **UDIM tile borders.** Shells near the edge of their tile show their distance to it, with separate *Border Minimal / Needed* thresholds. Shells crossing a tile line are flagged.
 - **Flipped shells.** Mirrored shells are highlighted, and a single button selects them.
+- **Texel density per shell.** Every shell is tinted by its texel density: red at your *Low* value, green at *Needed*, blue at *High*, with a gradient in between. Each shell is labeled with its value in px/cm, px/m, px/in or px/ft.
+- **Texel density in the 3D Viewport.** The same colors on the mesh itself. In Edit Mode they cover the objects being edited; in Object Mode, the selected objects, modifiers included.
 - **Adjustable.** Texture resolution (presets, custom non-square, or the image open in the editor), number of points, point position along the border, font size, opacity, line width, and colors.
-- **Fast.** Results are cached and recomputed only when the mesh or a relevant setting changes. The heavy lifting is vectorized NumPy code, so large layouts stay usable.
+- **Fast.** Meshes are read as whole arrays and processed with vectorized NumPy code. Results are cached and recomputed only when the mesh or a relevant setting changes, so large layouts stay usable.
 
 ---
 
@@ -29,7 +26,7 @@ The add-on comes in two forms with the same code inside. Install only one of the
 
 | File | Blender | Installs as |
 |---|---|---|
-| `uv_shell_gap_overlay-1.2.1.zip` | 4.2 and later | Extension |
+| `uv_shell_gap_overlay-1.3.0.zip` | 4.2 and later | Extension |
 | `uv_shell_gap_overlay.py` | 3.6 and later | Legacy add-on |
 
 **Blender 4.2 and later (4.5, 5.x)**
@@ -56,7 +53,7 @@ You can also drag the `.zip` from your file browser into the Blender window.
 | 4.2 LTS, 4.5 LTS | Tested with 4.2.23 and 4.5.14 |
 | 3.6 LTS | Supported with the `.py` file, not covered by the automated tests |
 
-"Tested" means the automated test suite passes in that version. It covers measurements, selection, panels and drawing, plus installing, enabling and removing both the `.zip` and the `.py`.
+"Tested" means the automated test suite passes in that version. It covers gap measurements, texel density, selection, panels and drawing (UV Editor and 3D Viewport), plus installing, enabling and removing both the `.zip` and the `.py`.
 
 ---
 
@@ -66,8 +63,10 @@ You can also drag the `.zip` from your file browser into the Blender window.
 2. Press **N** to open the sidebar and switch to the **UV Gaps** tab.
 3. Set **Texture** to the resolution you bake or paint at, or choose **Active Image**.
 4. Set **Minimal** and **Needed** to your padding targets.
+5. For texel density, tick the header checkbox of the **Texel Density** panel. Then pick a unit and set **Needed**, **Low** and **High**.
+6. To see the colors on the mesh, tick **Show in 3D Viewport**. The same settings are also in the 3D Viewport's sidebar, **UV Gaps** tab.
 
-The overlay updates as you edit the UVs.
+The overlays update as you edit.
 
 ---
 
@@ -80,22 +79,27 @@ The overlay updates as you edit the UVs.
 | Magenta ✕ with **Overlap** | The point lies inside another shell, or two shell borders cross there. |
 | Magenta ✕ with **Crosses tile** | The shell straddles a UDIM tile line. |
 | Blue tint, blue outline and **Flipped** | The shell's UVs are mirrored. |
+| Shell tinted red to blue, with a label like `512 px/m` | The shell's texel density (see below). Gray: the shell has no 3D area. |
+| Colored faces in the 3D Viewport | The texel density of each face's UV shell, in the same colors. |
 | Whole overlay dimmed | A heavy layout is still being edited. It refreshes once you pause. |
 
-**Colors:** red = 0 px (touching) → yellow = Minimal → green = Needed or more. Tile-border distances use the same colors with the *Border Minimal / Needed* values.
+**Gap colors:** red = 0 px (touching) → yellow = Minimal → green = Needed or more. Tile-border distances use the same colors with the *Border Minimal / Needed* values.
 
-**Label priority:** tile crossings, overlaps and flipped shells come first, then the smallest distances relative to their target. With *Hide Overlapping* on, less critical labels that would cover them are skipped. Lines are always drawn.
+**Texel density colors:** red at Low and below → yellow → green at Needed → cyan → blue at High and above. With Low 100, Needed 300 and High 500 px/m, a shell at 200 px/m is yellow and one at 400 px/m is cyan.
+
+**Label priority:** tile crossings, overlaps and flipped shells come first, then texel densities, then the smallest distances relative to their target. With *Hide Overlapping* on, less critical labels that would cover them are skipped. Lines and colors are always drawn.
 
 ---
 
 ## Settings
 
-Settings are stored per scene and live in the **UV Gaps** tab of the UV Editor sidebar. The checkbox in the panel header turns the whole overlay on or off. The overlay is also hidden when the UV Editor's own *Overlays* are turned off.
+Settings are stored per scene. They live in the **UV Gaps** tab of the UV Editor sidebar; the texel density settings are also in the **UV Gaps** tab of the 3D Viewport sidebar. The checkbox in a panel's header turns that overlay on or off, so gaps and texel density can be used separately or together. Overlays are also hidden when the editor's own *Overlays* are turned off.
 
-### Main panel
+### UV Shell Gaps panel
 
 | Setting | Default | Description |
 |---|---|---|
+| Header checkbox | on | Show the gap overlay. |
 | Texture | 2048 | Texture resolution used to convert UV distances to pixels. Options: 256–8192, **Custom** (separate Width × Height; non-square textures are supported), or **Active Image** (the size of the image shown in this UV Editor, falling back to Width × Height when there is none). |
 | Points per Shell | 24 | Measurement points spread evenly along each shell's whole border, outer border and holes included. |
 | Shift Along Border | 0 % | Slides every point along the border. 0–100 % covers one full step between neighboring points, so sweeping the slider checks the entire border. |
@@ -106,6 +110,8 @@ Settings are stored per scene and live in the **UV Gaps** tab of the UV Editor s
 | Flipped Shells: Show | on | Highlight mirrored shells. |
 | Flipped Shells: Select | — | Select all mirrored shells. See [Flipped shells](#flipped-shells). |
 | Refresh | — | Force a recompute. Normally not needed. |
+
+The summary box shows the number of shells and measured gaps, overlapping shell pairs, gaps and tile-border distances below Minimal / Needed, shells crossing a tile border, and flipped shells.
 
 ### UDIM Tile Borders (subpanel)
 
@@ -129,9 +135,24 @@ Settings are stored per scene and live in the **UV Gaps** tab of the UV Editor s
 
 *Touching (0 px)*, *At Minimal*, *At Needed*, *Overlap* and *Flipped* are all editable.
 
-### Summary box
+### Texel Density panel
 
-Shows the number of shells and measured gaps, overlapping shell pairs, gaps and tile-border distances below Minimal / Needed, shells crossing a tile border, and flipped shells.
+| Setting | Default | Description |
+|---|---|---|
+| Header checkbox | off | Tint and label every shell by its texel density in the UV Editor. |
+| Texture | 2048 | The same setting as in the gaps panel. Texel density depends on it. |
+| Unit | px/m | px/cm, px/m, px/in or px/ft. Switching the unit converts the values below; the densities they stand for don't change. |
+| Low (Red) | 100 px/m | Shells at or below this density are red. |
+| Needed (Green) | 300 px/m | The density you aim for. Shells at this density are green. |
+| High (Blue) | 500 px/m | Shells at or above this density are blue. |
+| Fill Opacity | 0.35 | Opacity of the density colors. |
+| Show in 3D Viewport | off | Also color the mesh in 3D Viewports. |
+
+The summary box shows the number of shells, the median, lowest and highest density, and how many shells are at or below Low and at or above High.
+
+### Texel Density in the 3D Viewport sidebar
+
+The **UV Gaps** tab of the 3D Viewport sidebar has the same texel density settings. Its header checkbox turns the 3D coloring on or off, and *Show in UV Editor* turns on the UV Editor overlay. In Edit Mode it colors the objects being edited. In Object Mode it colors the selected mesh objects.
 
 ---
 
@@ -157,6 +178,17 @@ Shells whose bounds span a tile line are reported as **Crosses tile** instead of
 - With UV Sync Selection on, it selects mesh faces.
 - With UV Sync Selection off, it selects UVs and leaves the mesh selection alone.
 
+**Texel density.** For each shell, texel density = √(texture pixels the shell covers ÷ its surface area in square meters).
+- Pixels covered = UV area × Width × Height. For a non-square texture the result is the geometric mean of the horizontal and vertical density.
+- The surface area is taken in world space, so object scale is included, non-uniform scale too.
+- One Blender unit is one meter. When the scene's unit system is Metric or Imperial, its *Unit Scale* is used instead (a Unit Scale of 0.01 means one unit is 1 cm).
+- The label sits on the face nearest the shell's center of area, so it stays on the shell even for rings and L-shapes.
+
+Which faces are colored:
+- **UV Editor:** the faces the UV Editor shows, as for gaps.
+- **3D Viewport in Edit Mode:** every visible face of the edited objects (the edit cage).
+- **3D Viewport in Object Mode:** the selected objects as they are drawn, modifiers included. With a Mirror modifier, for example, both halves are colored.
+
 ---
 
 ## Choosing padding values
@@ -169,19 +201,24 @@ If you rely on mipmaps, each mip level halves the distance in pixels, so texture
 
 ## Performance
 
-Results are cached at three levels:
-- Geometry is re-read only when the mesh changes.
+How work is saved:
+- The mesh is read as whole arrays only after it changes, never face by face. Shells, borders and texel density are then built with vectorized NumPy code.
 - Measurements are redone only when a relevant setting changes.
-- Redraws while panning or zooming reuse both.
+- Everything drawn for a view is reused until you pan or zoom or something changes.
+- Texel density colors are built once per change, in UV space for the UV Editor and in object space for the 3D Viewport. They are drawn through the view matrix, so panning and zooming cost nothing for them.
 
-Measured headless in Blender 4.2 to 5.2 with the default settings. These are CPU-side timings; GPU drawing time is not included.
+Measured headless in Blender 4.5 and 5.2 with the default settings. These are CPU-side timings; GPU drawing time is not included.
 
-| Layout | Re-read after an edit | Re-measure after a setting change | Redraw (pan / zoom) |
-|---|---|---|---|
-| 144 shells, 1.3k faces | ~12–17 ms | ~9–11 ms | ~2–3 ms |
-| 1,600 shells, 14.4k faces | ~0.17–0.21 s | ~0.12–0.13 s | ~12–16 ms |
+| Layout | Re-read after an edit | Re-measure after a setting change | Redraw, same view | Redraw while panning / zooming |
+|---|---|---|---|---|
+| 144 shells, 1.3k faces | ~5 ms | ~9–10 ms | ~0.3 ms | ~3 ms |
+| 1,600 shells, 14.4k faces | ~40–50 ms | ~0.12–0.15 s | ~0.3 ms | ~15–19 ms |
+
+With texel density on, re-reading takes about 5–15 ms longer on the larger layout. Compared with 1.2, re-reading is 4–5 times faster, and redrawing an unchanged view went from ~15 ms to ~0.3 ms.
 
 When a step takes longer than about 40 ms, the add-on waits until you pause for ~0.25 s and dims the overlay meanwhile. Editing and dragging sliders stay responsive.
+
+For very large layouts, lower *Points per Shell*: the gap measurement grows with points × shells. *Selected Shells Only* also helps while you work on part of the layout.
 
 ---
 
@@ -191,6 +228,9 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
 - Each point reports only its nearest neighbor.
 - UVs meant to wrap around (tiling textures) are not treated as wrapping. With Tile Borders on, every tile is a separate texture.
 - Flipped detection works per shell, based on its overall orientation. Individual folded faces inside an otherwise normal shell are not flagged.
+- Texel density is an average per shell. Stretching inside a shell, where one part is denser than another, is not shown.
+- In Edit Mode the 3D Viewport colors the edit cage. With modifiers shown in Edit Mode, such as Subdivision Surface or Mirror, the colors follow the cage, not the modifier result.
+- Texel density labels appear in the UV Editor only; the 3D Viewport shows the colors.
 - Only the active UV map of each mesh is measured.
 
 ---
@@ -204,13 +244,21 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
   - the UV Editor's *Overlays* are enabled.
 
   With UV Sync Selection off, only faces selected in the mesh are shown, and only those are measured.
-- **Numbers look too small or too large.** Check *Texture*: distances scale with the resolution.
+- **No colors in the 3D Viewport.** Check the header checkbox of the Texel Density panel in the 3D Viewport sidebar, and the viewport's *Overlays*. In Object Mode, the objects must be selected and have a UV map.
+- **Numbers look too small or too large.** Check *Texture*: distances and densities scale with the resolution. For texel density also check the scene's *Unit Scale* (*Scene Properties → Units*).
+- **A mesh named `.UV Gap Overlay scratch` appears under *Blender File* in the Outliner.** The add-on uses this empty helper mesh to read edit-mode meshes quickly. It has no users, is never saved with your file, and is removed when the add-on is turned off.
 - **The add-on appears twice in the Add-ons list.** Both the `.py` and the `.zip` are installed. Uninstall one of them and restart Blender.
 - **Something went wrong.** The add-on prints each error once to the system console. On Windows use *Window → Toggle System Console*; on other systems start Blender from a terminal.
 
 ---
 
 ## Changelog
+
+**1.3.0**
+- Texel density per UV shell in the UV Editor: a color overlay (red at Low, green at Needed, blue at High, a gradient in between) and a label on every shell, in px/cm, px/m, px/in or px/ft.
+- Texel density on the mesh in the 3D Viewport, with its own sidebar panel. Edit Mode colors the edit cage; Object Mode colors the selected objects, modifiers included.
+- The gap overlay and the texel density overlay can be turned on independently.
+- Faster: meshes are read as whole arrays instead of face by face, so re-reading after an edit is 4–5 times faster. Redrawing an unchanged view reuses everything already drawn.
 
 **1.2.1**
 - Fixed: moving UVs with the overlay on could scramble the UV layout. When the overlay refreshed during a drag, Blender moved the mesh data in memory under the running tool. The overlay now reads a private copy of the mesh and never touches the one being edited.
@@ -233,6 +281,9 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
 
 ---
 
+## Authors
+
+Iurii Kruglov & Claude (Anthropic)
 
 ## License
 
