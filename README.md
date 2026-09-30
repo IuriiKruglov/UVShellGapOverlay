@@ -2,7 +2,6 @@
 
 A Blender add-on for the UV Editor that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, and how far shells sit from their UDIM tile border. Every measurement is color-graded against the padding you need. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
 
-**Version:** 1.2.1 · **Blender:** 3.6 LTS to 5.2 LTS · **Authors:** Iurii Kruglov & Claude (Anthropic) · **License:** GPL-3.0-or-later
 
 ---
 
@@ -228,9 +227,6 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
 
 ---
 
-## Authors
-
-Iurii Kruglov & Claude (Anthropic)
 
 ## License
 
