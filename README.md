@@ -1,3 +1,8 @@
+
+<img width="1245" height="904" alt="UVShell_Gap_1" src="https://github.com/user-attachments/assets/08949696-df58-4a27-b3a1-f256382ebb11" />
+
+
+
 # UV Shell Gap Overlay
 
 A Blender add-on for the UV Editor that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, and how far shells sit from their UDIM tile border. Every measurement is color-graded against the padding you need. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
