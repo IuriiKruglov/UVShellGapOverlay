@@ -2,6 +2,8 @@
 
 A Blender add-on for the UV Editor that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, and how far shells sit from their UDIM tile border. Every measurement is color-graded against the padding you need. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
 
+**Version:** 1.2.1 · **Blender:** 3.6 LTS to 5.2 LTS · **Authors:** Iurii Kruglov & Claude (Anthropic) · **License:** GPL-3.0-or-later
+
 ---
 
 ## Features
@@ -22,7 +24,7 @@ The add-on comes in two forms with the same code inside. Install only one of the
 
 | File | Blender | Installs as |
 |---|---|---|
-| `uv_shell_gap_overlay-1.2.0.zip` | 4.2 and later | Extension |
+| `uv_shell_gap_overlay-1.2.1.zip` | 4.2 and later | Extension |
 | `uv_shell_gap_overlay.py` | 3.6 and later | Legacy add-on |
 
 **Blender 4.2 and later (4.5, 5.x)**
@@ -171,8 +173,8 @@ Measured headless in Blender 4.2 to 5.2 with the default settings. These are CPU
 
 | Layout | Re-read after an edit | Re-measure after a setting change | Redraw (pan / zoom) |
 |---|---|---|---|
-| 144 shells, 1.3k faces | ~10–15 ms | ~7–9 ms | ~2–3 ms |
-| 1,600 shells, 14.4k faces | ~0.13–0.17 s | ~0.10–0.12 s | ~14–15 ms |
+| 144 shells, 1.3k faces | ~12–17 ms | ~9–11 ms | ~2–3 ms |
+| 1,600 shells, 14.4k faces | ~0.17–0.21 s | ~0.12–0.13 s | ~12–16 ms |
 
 When a step takes longer than about 40 ms, the add-on waits until you pause for ~0.25 s and dims the overlay meanwhile. Editing and dragging sliders stay responsive.
 
@@ -205,6 +207,9 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
 
 ## Changelog
 
+**1.2.1**
+- Fixed: moving UVs with the overlay on could scramble the UV layout. When the overlay refreshed during a drag, Blender moved the mesh data in memory under the running tool. The overlay now reads a private copy of the mesh and never touches the one being edited.
+
 **1.2.0**
 - Blender 5 support (5.0, 5.1, 5.2 LTS). *Selected Shells Only* and *Select Flipped* work with Blender 5's new UV selection, including UV Sync Selection.
 - Also packaged as an extension (`.zip`) for Blender 4.2 and later.
@@ -221,7 +226,11 @@ When a step takes longer than about 40 ms, the add-on waits until you pause for 
 - Overlap detection.
 - Sidebar settings and label decluttering.
 
+---
 
+## Authors
+
+Iurii Kruglov & Claude (Anthropic)
 
 ## License
 
