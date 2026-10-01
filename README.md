@@ -1,17 +1,6 @@
-<table>
-  <tr>
-    <td>
-      <a href="https://github.com">
-        <img src="https://github.com/user-attachments/assets/0dade392-4dce-4471-9a60-366ac326ee1c" />
-      </a>
-    </td>
-    <td>
-      <a href="https://github.com">
-        <img src="https://github.com/user-attachments/assets/508549e1-e3ac-4bdd-aceb-4392e8eaac06" />
-      </a>
-    </td>
-  </tr>
-</table>
+| | |
+| :---: | :---: |
+| [![UVShell_Gap_3](https://github.com/user-attachments/assets/0dade392-4dce-4471-9a60-366ac326ee1c)](https://github.com/user-attachments/assets/0dade392-4dce-4471-9a60-366ac326ee1c) | [![UVShell_Gap_2](https://github.com/user-attachments/assets/508549e1-e3ac-4bdd-aceb-4392e8eaac06)](https://github.com/user-attachments/assets/508549e1-e3ac-4bdd-aceb-4392e8eaac06) |
 
 
 # UV Shell Gap Overlay
