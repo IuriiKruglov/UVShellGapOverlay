@@ -1,5 +1,3 @@
-<img width="1541" height="905" alt="UVShell_Gap_2" src="https://github.com/user-attachments/assets/c4f50141-fb7c-4c24-a729-c576b9c3a2e7" />
-
 # UV Shell Gap Overlay
 
 A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
@@ -16,7 +14,7 @@ A Blender add-on that shows, directly on your UV layout, how many texture pixels
 - **Same material only.** Gaps and overlaps can be limited to shells of the same material, since each material usually has its own texture.
 - **UDIM tile borders.** Shells near the edge of their tile show their distance to it, with separate *Border Minimal / Needed* thresholds. Shells crossing a tile line are flagged.
 - **Flipped shells.** Mirrored shells are highlighted, and a single button selects them.
-- **Texel density per shell.** Every shell is tinted by its texel density: red at your *Low* value, green at *Needed*, blue at *High*, with a gradient in between. Values are shown in px/cm, px/m, px/in or px/ft.
+- **Texel density per shell.** Every shell is tinted by its texel density: red at your *Low* value, green at *Needed*, blue at *High*, with a gradient in between. Values are shown in px/cm, px/m, px/in or px/ft. See [Texel density](#texel-density).
 - **Auto Low / High.** *Low* and *High* can fill themselves with the lowest and highest density of the material sets you check, and stay editable.
 - **Select by texel density.** A From / To range over the analyzed densities selects every shell inside it. The shells in range are outlined.
 - **Texel density in the 3D Viewport.** The same colors on the mesh itself. In Edit Mode they cover the objects being edited; in Object Mode, the selected objects, modifiers included.
@@ -77,6 +75,50 @@ You can also drag the `.zip` from your file browser into the Blender window.
 8. For orientation arrows, open **Shell Info** and tick **Orientation Arrows**.
 
 The overlays update as you edit.
+
+---
+
+## Texel density
+
+Texel density is how many texture pixels cover one meter of the model's surface. When it is even across a model, and across the models in a scene, textures look equally sharp everywhere. A shell with too little density looks blurry next to its neighbors; one with too much spends texture space that other shells could use.
+
+The add-on finds the density of every UV shell and shows it in two places: on the UV layout, where you fix it, and on the model in the 3D Viewport, where you see the result. Both use the same settings (*Texture*, *Unit*, *Low*, *Needed* and *High*) and the same colors.
+
+**How the number is found.** The texture pixels a shell covers are divided by its surface area in square meters, and the square root is taken. A 1 × 1 m face whose UVs span a quarter of the width and height of a 2048 px texture covers 512 × 512 pixels, so its density is 512 px/m. Object scale counts, and so does the scene's *Unit Scale*. The details are under [How it measures](#how-it-measures).
+
+**The colors.** Each shell is tinted by how its density compares with your values:
+
+| Color | Density |
+|---|---|
+| Red | at or below *Low* |
+| Yellow | between *Low* and *Needed* |
+| Green | at *Needed*, your target |
+| Cyan | between *Needed* and *High* |
+| Blue | at or above *High* |
+| Gray | the shell has no 3D area |
+
+Red and yellow shells get fewer pixels than your target and will look softer; cyan and blue ones use more texture space than they need. *Fill Opacity* sets how strongly the colors cover the UV layout and the shaded model.
+
+### In the UV Editor
+
+Tick the header checkbox of the **Texel Density** panel (UV Editor sidebar, **UV Gaps** tab).
+- Every shell the UV Editor shows is tinted, and its info block gives its density in px/cm, px/m, px/in or px/ft.
+- The values follow your edits: scale a shell and its color and number change with it.
+- The summary box lists the number of shells, their median, lowest and highest density, and how many are at or below Low and at or above High.
+- With *Auto Low / High* on, red marks the least dense shells of the checked material sets and blue the densest, so the spread shows at a glance. Type your own Low and High to grade against fixed limits instead.
+- **Select by Range** outlines the shells inside a From / To range of densities and selects them with one click. For example, lower *To* until the least dense shells are outlined, select them, and scale them up until they turn green.
+- The **Materials** list shows each material's density range, so a texture set that is out of line stands out.
+
+### In the 3D Viewport
+
+Tick **Show in 3D Viewport** in the same panel, or the header checkbox of the **Texel Density** panel in the 3D Viewport sidebar (**UV Gaps** tab). That panel has the same settings and its own summary box.
+- Every face takes the color of its UV shell, drawn over the shaded model, so you can see on the model itself where texture resolution falls short or is wasted. Surfaces behind others are not colored through.
+- **Edit Mode:** the objects being edited are colored, and the colors follow your UV edits. Hidden faces are left out. The colors sit on the edit cage, not on the modifier result.
+- **Object Mode:** the selected mesh objects are colored as they are drawn, modifiers included. This is the way to compare several props, or a whole scene, against one target density.
+- Each object uses its active UV map. With *Texture* set to *Active Image*, the size of the image open in a UV Editor is used.
+- The 3D Viewport shows only the colors; the numbers are in the UV Editor and in the panel's summary box.
+- The colors are part of the viewport's overlays, so its *Overlays* must be on.
+- Changing Low, Needed, High, the unit or the texture size recolors at once. With many objects selected, the colors appear over a few frames instead of freezing the viewport.
 
 ---
 
@@ -367,7 +409,7 @@ For very large layouts, lower *Points per Shell*: the gap measurement grows with
 - One info block per shell holds its texel density, a `Scale …` note when its object's scale is not 1, and *Flipped*, so these no longer cover each other.
 - Orientation arrows in the info blocks: where the scene's up (+Z) runs across each shell, or +Y on shells lying flat.
 - *Auto Low / High*: Low and High fill themselves with the lowest and highest density of the checked material sets, and stay editable. Files from earlier versions with Low or High changed keep their values (Auto starts off for them).
-- *Select by Range*: From / To sliders over the analyzed densities select the shells in range; the shells in range are outlined while you adjust it.
+- *Select by Range*: From / To sliders over the analyzed densities outline the shells in range and select them.
 - Texel density colors are computed on the GPU. Changing thresholds, units, texture size or opacity no longer rebuilds anything; nor does moving or rotating objects.
 - 3D Viewport: objects are prepared a few per frame, so turning the overlay on with many objects selected no longer freezes the view. Less Python work per redraw.
 - The Display settings (font size, opacity, label background) now apply to every label, not only to the gap overlay.
@@ -399,7 +441,6 @@ For very large layouts, lower *Points per Shell*: the gap measurement grows with
 - Sidebar settings and label decluttering.
 
 ---
-
 
 ## License
 
