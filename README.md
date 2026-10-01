@@ -1,8 +1,10 @@
+<img width="1541" height="905" alt="UVShell_Gap_2" src="https://github.com/user-attachments/assets/c4f50141-fb7c-4c24-a729-c576b9c3a2e7" />
+
 # UV Shell Gap Overlay
 
 A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells.
 
-**Version:** 1.4.0 · **Blender:** 3.6 LTS to 5.2 LTS · **Authors:** Iurii Kruglov & Claude (Anthropic) · **License:** GPL-3.0-or-later
+**Version:** 1.4.0 · **Blender:** 3.6 LTS to 5.2 LTS · **License:** GPL-3.0-or-later
 
 ---
 
@@ -398,9 +400,6 @@ For very large layouts, lower *Points per Shell*: the gap measurement grows with
 
 ---
 
-## Authors
-
-Iurii Kruglov & Claude (Anthropic)
 
 ## License
 
