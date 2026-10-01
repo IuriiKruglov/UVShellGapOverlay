@@ -6,18 +6,22 @@
 # neighboring UV shells and from shells to their UDIM tile border, graded
 # against minimal / needed padding; marks overlapping, tile-crossing and
 # flipped (mirrored) shells. Colors and labels every shell by its texel
-# density, in the UV Editor and on the mesh in the 3D Viewport.
+# density, in the UV Editor and on the mesh in the 3D Viewport. One info
+# block per shell collects its texel density, object scale, flip state and
+# an arrow for the scene's up direction. Material sets: select, hide and
+# reveal the shells of chosen materials, measure gaps only within a material.
 #
 # Authors: Iurii Kruglov & Claude (Anthropic)
 
 bl_info = {
     "name": "UV Shell Gap Overlay",
     "author": "Iurii Kruglov, Claude (Anthropic)",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (3, 6, 0),
     "location": "UV Editor / 3D Viewport > Sidebar (N) > UV Gaps",
     "description": "Pixel gaps between UV shells and to UDIM tile borders, texel density per shell "
-                   "(UV Editor and 3D Viewport); overlap, tile-crossing and flipped-shell checks",
+                   "(UV Editor and 3D Viewport), per-shell info blocks, material sets; overlap, "
+                   "tile-crossing and flipped-shell checks",
     "category": "UV",
 }
 
@@ -32,11 +36,13 @@ import numpy as np
 from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
     IntProperty,
     PointerProperty,
+    StringProperty,
 )
 from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix
@@ -61,7 +67,10 @@ PROBES_PER_SHELL = 8
 MAX_CROSS_MARKS = 48     # crossing markers kept per overlapping shell pair / tile-crossing shell
 LIVE_MS = 40.0           # work cheaper than this is redone on every change
 DEBOUNCE_S = 0.25        # heavier work waits until changes pause this long
+TD3D_BUDGET_MS = 30.0    # 3D view: objects are (re)built until a frame has used this much, the rest next frame
+ORIENT_MIN = 0.3         # an arrow needs the axis to lie this much along the shell (area-weighted, 0..1)
 FONT_ID = 0
+NO_MATERIAL = "(No Material)"
 
 # Blender 5.0 moved UV selection from BMLoopUV.select / select_edge to
 # BMLoop.uv_select_vert / uv_select_edge and BMFace.uv_select (shared by all UV maps).
@@ -107,8 +116,14 @@ class _State:
     frame = {}           # per-view draw data, reused while the view and data are unchanged
     td_uv_stats = None   # summary for the panels
     td_3d_stats = None
+    td3d_frame = None    # 3D view: (key, stats) of the last frame, reused while nothing changed
+    pub = None           # per-shell densities and materials for the panels (_Published):
+                         # from the UV editor in Edit Mode, from the 3D view in Object Mode
+    auto_key = None      # what Low / High were last auto-filled for
+    pending = {}         # scene property writes queued for a timer (not allowed while drawing)
     fast_read = None     # None: untested, True: scratch-mesh reading works, False: fall back
     shader_names = {}
+    td_shader = None     # None: not tried yet, False: unavailable (per-vertex colors instead)
     numpy_buffers = True
     last_error = None
     reported = set()
@@ -126,6 +141,7 @@ class _State:
         cls.td_values.clear()
         cls.td_fill.clear()
         cls.frame.clear()
+        cls.td3d_frame = None
 
     @classmethod
     def reset(cls):
@@ -138,6 +154,9 @@ class _State:
         cls.id_gen.clear()
         cls.td_uv_stats = None
         cls.td_3d_stats = None
+        cls.pub = None
+        cls.auto_key = None
+        cls.pending = {}
         cls.fast_read = None
 
 
@@ -181,6 +200,24 @@ def _on_td_changed(self, context):
     _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
 
 
+def _on_auto_range(self, context):
+    if self.td_auto_range:
+        _State.auto_key = None  # fill again on the next redraw
+    _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+
+
+def _on_range_from(self, context):
+    if self.td_sel_to < self.td_sel_from:
+        self.td_sel_to = self.td_sel_from  # the handles don't pass each other
+    _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+
+
+def _on_range_to(self, context):
+    if self.td_sel_from > self.td_sel_to:
+        self.td_sel_from = self.td_sel_to
+    _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+
+
 # ---------------------------------------------------------------------------
 # Settings (Scene.uv_gap_overlay)
 # ---------------------------------------------------------------------------
@@ -207,17 +244,32 @@ _TD_FACTOR = {u[0]: u[3] for u in _TD_UNITS}
 _TD_LABEL = {u[0]: u[1] for u in _TD_UNITS}
 
 
-def _td_value(stored, name, description):
+def _td_value(stored, name, description, manual=False):
     """A texel density shown in the chosen unit but stored in px/m, so switching the unit
-    converts the value instead of reinterpreting it."""
+    converts the value instead of reinterpreting it. `manual`: typing a value turns the
+    Low / High auto-fill off, so the typed value stays (also after reopening the file)."""
     def get_value(self):
         return float(getattr(self, stored)) * _TD_FACTOR.get(self.td_unit, 1.0)
 
     def set_value(self, value):
         setattr(self, stored, max(0.0, float(value)) / _TD_FACTOR.get(self.td_unit, 1.0))
+        if manual and self.td_auto_range:
+            self.td_auto_range = False
 
     return FloatProperty(name=name, description=description, get=get_value, set=set_value,
                          min=0.0, soft_max=100000.0, step=100, precision=2, update=_on_td_changed)
+
+
+class UVGAP_MaterialItem(bpy.types.PropertyGroup):
+    """One material set of the Materials list (`name` is what the list shows)."""
+    key: StringProperty(
+        name="Material", description="Full name of the material; empty for faces without a material",
+        options={'HIDDEN'})
+    checked: BoolProperty(
+        name="Use",
+        description="Include this material set: Low / High auto-fill, Select, Hide and Reveal act on "
+                    "the checked sets",
+        default=False, update=_on_td_changed)
 
 
 class UVGAP_Settings(bpy.types.PropertyGroup):
@@ -267,6 +319,12 @@ class UVGAP_Settings(bpy.types.PropertyGroup):
         name="Selected Shells Only",
         description="Measure only from shells that have selected UVs (distances still go to every shell)",
         default=False, update=_on_setting_changed)
+    same_material: BoolProperty(
+        name="Same Material Only",
+        description="Measure gaps and find overlaps only between shells of the same material (each "
+                    "material has its own texture). A shell's material is the one covering most of "
+                    "its UV area",
+        default=True, update=_on_setting_changed)
 
     # UDIM tile borders
     tile_border: BoolProperty(
@@ -345,11 +403,57 @@ class UVGAP_Settings(bpy.types.PropertyGroup):
     td_low_m: FloatProperty(default=100.0, min=0.0, options={'HIDDEN'})
     td_high_m: FloatProperty(default=500.0, min=0.0, options={'HIDDEN'})
     td_needed: _td_value("td_needed_m", "Needed", "Target texel density, shown green")
-    td_low: _td_value("td_low_m", "Low", "Texel density shown red; lower densities are red too")
-    td_high: _td_value("td_high_m", "High", "Texel density shown blue; higher densities are blue too")
+    td_low: _td_value("td_low_m", "Low", "Texel density shown red; lower densities are red too. "
+                      "Typing a value turns Auto Low / High off", manual=True)
+    td_high: _td_value("td_high_m", "High", "Texel density shown blue; higher densities are blue too. "
+                       "Typing a value turns Auto Low / High off", manual=True)
     td_fill_opacity: FloatProperty(
         name="Fill Opacity", description="Opacity of the texel density colors",
         default=0.35, min=0.0, max=1.0, subtype='FACTOR', update=_on_td_changed)
+    td_auto_range: BoolProperty(
+        name="Auto Low / High",
+        description="Fill Low and High with the lowest and highest texel density of the checked "
+                    "material sets (all shells when none is checked) whenever the checked sets or the "
+                    "objects change. Typing into Low or High turns this off and keeps the typed values",
+        default=True, update=_on_auto_range)
+
+    # texel density range selection (percent of the analyzed lowest..highest density)
+    td_sel_from: FloatProperty(
+        name="From", description="Lower end of the range: 0% is the lowest texel density of the shells, "
+                                 "100% the highest",
+        default=0.0, min=0.0, max=100.0, subtype='PERCENTAGE', precision=1, update=_on_range_from)
+    td_sel_to: FloatProperty(
+        name="To", description="Upper end of the range: 0% is the lowest texel density of the shells, "
+                               "100% the highest",
+        default=100.0, min=0.0, max=100.0, subtype='PERCENTAGE', precision=1, update=_on_range_to)
+    td_range_highlight: BoolProperty(
+        name="Highlight Range",
+        description="Outline the shells inside the range in the UV Editor while the range is narrower "
+                    "than all shells",
+        default=True, update=_on_td_changed)
+
+    # per-shell info blocks
+    info_show: BoolProperty(
+        name="Shell Info",
+        description="One info block per shell with its texel density, object scale, flip state and "
+                    "orientation arrow, placed so blocks don't overlap",
+        default=True, update=_on_setting_changed)
+    show_orientation: BoolProperty(
+        name="Orientation Arrows",
+        description="Arrow in each shell's info block pointing where the scene's up (+Z) runs across "
+                    "the shell (blue); on shells lying flat, where +Y runs (green)",
+        default=False, update=_on_setting_changed)
+    show_scale: BoolProperty(
+        name="Object Scale",
+        description="Note the object scale on the shells of objects whose scale is not 1",
+        default=True, update=_on_setting_changed)
+
+    # material sets
+    materials: CollectionProperty(type=UVGAP_MaterialItem)
+    material_index: IntProperty(name="Active Material Set", default=0, min=0)
+
+    # 140: Low / High managed by 1.4 (see _migrate_settings)
+    settings_version: IntProperty(default=0, options={'HIDDEN'})
 
 
 def _resolve_resolution(st, space):
@@ -597,7 +701,7 @@ _SCRATCH_MESH = ".UV Gap Overlay scratch"
 class _Arrays:
     """Raw data of one mesh: corners (loops), faces, vertices, optionally 3D data."""
     __slots__ = ("uv_name", "sync_valid", "sel_readable", "loop_vert", "uv", "f_start", "f_total",
-                 "f_hide", "f_sel", "v_sel", "uv_sel", "co", "tri_loops", "tri_face", "fast")
+                 "f_hide", "f_sel", "f_mat", "v_sel", "uv_sel", "co", "tri_loops", "tri_face", "fast")
 
 
 def _create_scratch_mesh():
@@ -682,6 +786,9 @@ def _arrays_from_mesh(me, uv_name, want_3d):
         A.f_total = _get(me.polygons, "loop_total", nF, np.int32)
     A.f_hide = _flags(me, ".hide_poly", 'FACE', nF, me.polygons, "hide")
     A.f_sel = _flags(me, ".select_poly", 'FACE', nF, me.polygons, "select")
+    A.f_mat = _attr(me, "material_index", 'FACE', 'INT', nF)  # left out while every index is 0
+    if A.f_mat is None:
+        A.f_mat = _get(me.polygons, "material_index", nF, np.int32)
     A.v_sel = _flags(me, ".select_vert", 'POINT', nV, me.vertices, "select")
     # UV selection of the face corners (Blender 5.0+ / Blender 3.5 - 4.x); left out while empty
     A.uv_sel = _attr(me, ".uv_select_vert" if _UV_SELECT_ON_LOOP else ".vs." + uv_name, 'CORNER', 'BOOLEAN', nL)
@@ -708,13 +815,14 @@ def _arrays_from_bmesh(bm, uvl, want_3d):
     """The same arrays, walked in Python (slow path). `bm` must be a private copy."""
     A = _Arrays()
     bm.verts.index_update()
-    lv, uv, tot, hide, sel, usel = [], [], [], [], [], []
+    lv, uv, tot, hide, sel, mat, usel = [], [], [], [], [], [], []
     readable = True
     for f in bm.faces:
         loops = f.loops
         tot.append(len(loops))
         hide.append(f.hide)
         sel.append(f.select)
+        mat.append(f.material_index)
         for loop in loops:
             lv.append(loop.vert.index)
             luv = loop[uvl]
@@ -732,6 +840,7 @@ def _arrays_from_bmesh(bm, uvl, want_3d):
         np.cumsum(A.f_total[:-1], out=A.f_start[1:])
     A.f_hide = np.asarray(hide, dtype=bool)
     A.f_sel = np.asarray(sel, dtype=bool)
+    A.f_mat = np.asarray(mat, dtype=np.int32)
     A.v_sel = np.asarray([v.select for v in bm.verts], dtype=bool)
     A.sel_readable = readable
     A.uv_sel = np.asarray(usel, dtype=bool) if readable else np.zeros(len(lv), dtype=bool)
@@ -1010,6 +1119,7 @@ def _gap_pieces(S, A, sel_kind):
     tris = np.stack((np.column_stack((S.vx[v0], S.vy[v0])), np.column_stack((S.vx[v1], S.vy[v1])),
                      np.column_stack((S.vx[v2], S.vy[v2]))), axis=1)
     return {
+        "shells": shells_e,
         "seg_a": np.column_stack((S.vx[ch_a], S.vy[ch_a])),
         "seg_b": np.column_stack((S.vx[ch_b], S.vy[ch_b])),
         "sign": ch_sg.astype(np.float64),
@@ -1035,11 +1145,96 @@ def _face_area_vectors(S, A):
     return np.add.reduceat(np.cross(P, P[S.nxt]), S.off, axis=0) * 0.5
 
 
-def _td_pieces(S, A, matrix):
-    """Texel density inputs per shell (UV area, world area) and label points, plus the
-    triangles of every face for the colored fill (UV editor)."""
+def _material_keys(obj):
+    """Material of each slot (full name, "" for an empty slot); [""] for an object without slots."""
+    keys = [slot.material.name_full if slot.material is not None else "" for slot in obj.material_slots]
+    return keys or [""]
+
+
+def _material_sets(obj):
+    """(material keys without repeats, set id of each slot): slots holding the same material,
+    or several empty slots, are one material set."""
+    keys = _material_keys(obj)
+    uniq = list(dict.fromkeys(keys))
+    return uniq, np.asarray([uniq.index(k) for k in keys], dtype=np.int64)
+
+
+def _face_materials(A, lut):
+    """Material id of every face; indices past the last slot use the last slot, as Blender draws them."""
+    return lut[np.clip(A.f_mat, 0, lut.size - 1)]
+
+
+def _dominant(fsh, fmat, weight, ns):
+    """The material of each shell: the one covering most of its UV area (then more faces, lower id)."""
+    out = np.zeros(ns, dtype=np.int64)
+    if not fsh.size:
+        return out
+    nm = int(fmat.max()) + 1
+    key = fsh * nm + fmat
+    o = np.argsort(key, kind='stable')
+    k = key[o]
+    starts = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+    area = np.add.reduceat(weight[o], starts)
+    count = np.diff(np.r_[starts, k.size])
+    ush, um = k[starts] // nm, k[starts] % nm
+    o2 = np.lexsort((um, -count, -area, ush))
+    first = np.r_[True, ush[o2][1:] != ush[o2][:-1]]
+    out[ush[o2][first]] = um[o2][first]
+    return out
+
+
+def _shell_orientation(S, A, M3, cx, cy, face_area):
+    """Where the scene's up axis (+Z) runs across each shell, as a unit direction in UV space.
+
+    Each face's UV -> 3D mapping is fitted to its corners (least squares); the axis, projected
+    onto the face, is taken back to UV space and weighted by how much of it lies along the face
+    and by the face's area. Shells lying flat (+Z mostly along their normal) use +Y instead.
+    Returns directions (NaN: no arrow) and the axis (0 none, 1 +Z, 2 +Y) per shell."""
+    ns, fsh, lf = S.nshell, S.face_shell, S.lface
+    du = S.vx[S.vid] - cx[lf]
+    dv = S.vy[S.vid] - cy[lf]
+    P = A.co[A.loop_vert[S.lid]].astype(np.float64) @ M3.T  # world orientation and scale
+    dP = P - (np.add.reduceat(P, S.off, axis=0) / S.tot[:, None])[lf]
+    suu = np.add.reduceat(du * du, S.off)
+    suv = np.add.reduceat(du * dv, S.off)
+    svv = np.add.reduceat(dv * dv, S.off)
+    spu = np.add.reduceat(dP * du[:, None], S.off, axis=0)
+    spv = np.add.reduceat(dP * dv[:, None], S.off, axis=0)
+    orient = np.full((ns, 2), np.nan)
+    axis = np.zeros(ns, dtype=np.int8)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        det = suu * svv - suv * suv
+        ok = det > 1e-12 * (suu + svv) ** 2
+        Ju = (spu * svv[:, None] - spv * suv[:, None]) / det[:, None]  # dP/du
+        Jv = (spv * suu[:, None] - spu * suv[:, None]) / det[:, None]  # dP/dv
+        g11 = (Ju * Ju).sum(axis=1)
+        g12 = (Ju * Jv).sum(axis=1)
+        g22 = (Jv * Jv).sum(axis=1)
+        gdet = g11 * g22 - g12 * g12
+        ok &= gdet > 1e-12 * (g11 + g22) ** 2
+        total = np.bincount(fsh, weights=face_area, minlength=ns)
+        for code, comp in ((1, 2), (2, 1)):  # +Z, then +Y for what is left
+            b1, b2 = Ju[:, comp], Jv[:, comp]
+            wu = (g22 * b1 - g12 * b2) / gdet  # UV step whose 3D image is the axis on the face
+            wv = (g11 * b2 - g12 * b1) / gdet
+            along = b1 * wu + b2 * wv          # squared length of the axis on the face, 0..1
+            wn = np.hypot(wu, wv)
+            good = ok & np.isfinite(wn) & (wn > 0.0) & (along > 0.0)
+            wt = np.where(good, face_area * np.sqrt(np.clip(along, 0.0, 1.0)) / np.where(good, wn, 1.0), 0.0)
+            vx = np.bincount(fsh, weights=np.where(good, wu, 0.0) * wt, minlength=ns)
+            vy = np.bincount(fsh, weights=np.where(good, wv, 0.0) * wt, minlength=ns)
+            mag = np.hypot(vx, vy)
+            pick = (axis == 0) & (mag > 0.0) & (mag >= ORIENT_MIN * total)
+            orient[pick, 0] = vx[pick] / mag[pick]
+            orient[pick, 1] = vy[pick] / mag[pick]
+            axis[pick] = code
+    return orient, axis
+
+
+def _shell_pieces(S, A, matrix, fmat, want_3d, want_orient=False):
+    """Per shell: label point, UV area and material; with 3D data also the world area (texel
+    density), the triangles for the colored fill and, if wanted, the up direction in UV space."""
     uv_abs = np.abs(S.area2) * 0.5
-    world = np.linalg.norm(_face_area_vectors(S, A) @ _cofactor(np.array(matrix.to_3x3())).T, axis=1)
     fsh, ns = S.face_shell, S.nshell
     # label point: centroid of the face nearest to the shell's area-weighted centroid,
     # which is always on the shell (also for rings and concave shells)
@@ -1058,18 +1253,25 @@ def _td_pieces(S, A, matrix):
     d2 = (cx - sx[fsh]) ** 2 + (cy - sy[fsh]) ** 2
     o = np.lexsort((d2, fsh))
     nearest = o[np.concatenate(([True], fsh[o][1:] != fsh[o][:-1]))]
-    cmap = np.full(A.f_total.size, -1, dtype=np.int64)
-    cmap[S.fidx] = np.arange(S.fidx.size)
-    tc = cmap[A.tri_face]
-    keep = tc >= 0
-    return {
+    out = {
         "nshell": ns,
         "uv_area": w,
-        "world_area": np.bincount(fsh, weights=world, minlength=ns),
         "anchor": np.column_stack((cx[nearest], cy[nearest])),
-        "tri_uv": A.uv[A.tri_loops[keep]].astype(np.float32),
-        "tri_shell": fsh[tc[keep]],
+        "mat": _dominant(fsh, fmat, uv_abs, ns),
     }
+    if want_3d:
+        M3 = np.array(matrix.to_3x3(), dtype=np.float64)
+        world = np.linalg.norm(_face_area_vectors(S, A) @ _cofactor(M3).T, axis=1)
+        out["world_area"] = np.bincount(fsh, weights=world, minlength=ns)
+        if want_orient:
+            out["orient"], out["axis"] = _shell_orientation(S, A, M3, cx, cy, world)
+        cmap = np.full(A.f_total.size, -1, dtype=np.int64)
+        cmap[S.fidx] = np.arange(S.fidx.size)
+        tc = cmap[A.tri_face]
+        keep = tc >= 0
+        out["tri_uv"] = A.uv[A.tri_loops[keep]].astype(np.float32)
+        out["tri_shell"] = fsh[tc[keep]]
+    return out
 
 
 class _Geometry:
@@ -1077,7 +1279,10 @@ class _Geometry:
                  "bmin", "bmax", "pairs", "nshells", "nfaces",
                  "shell_area", "flipped", "flip_tris", "flip_tri_shell",
                  "tile", "tile_cross", "tile_cross_pts",
-                 "td_nshells", "td_uv_area", "td_world_area", "td_anchor", "td_tri_uv", "td_tri_shell")
+                 "td_nshells", "td_uv_area", "td_world_area", "td_anchor", "td_tri_uv", "td_tri_shell",
+                 # every shown shell (the arrays above cover the shells with a border, "gap shells")
+                 "sh_n", "sh_obj", "sh_mat", "sh_anchor", "sh_orient", "sh_axis", "sh_gid",
+                 "gap_shell", "shell_mat", "mat_keys", "mat_total", "mat_vis", "obj_names", "obj_scale")
 
     def __init__(self):
         self.seg_a = _EMPTY2
@@ -1104,11 +1309,38 @@ class _Geometry:
         self.td_anchor = _EMPTY2
         self.td_tri_uv = np.empty((0, 3, 2), dtype=np.float32)
         self.td_tri_shell = _EMPTY_I
+        self.sh_n = 0
+        self.sh_obj = _EMPTY_I
+        self.sh_mat = _EMPTY_I
+        self.sh_anchor = _EMPTY2
+        self.sh_orient = _EMPTY2
+        self.sh_axis = np.empty(0, dtype=np.int8)
+        self.sh_gid = _EMPTY_I
+        self.gap_shell = _EMPTY_I
+        self.shell_mat = _EMPTY_I
+        self.mat_keys = []
+        self.mat_total = _EMPTY_I
+        self.mat_vis = _EMPTY_I
+        self.obj_names = []
+        self.obj_scale = []
 
 
-def _extract(objects, sync, want_sel, want_td=False, reuse=False):
+def _extract(objects, sync, want_sel, want_td=False, reuse=False, want_orient=False):
     geo = _Geometry()
-    gaps, tds = [], []
+    gaps, shs = [], []
+    mat_id, mat_total, mat_vis = {}, [], []
+
+    def material_ids(keys):
+        out = []
+        for key in keys:
+            i = mat_id.get(key)
+            if i is None:
+                i = mat_id[key] = len(mat_total)
+                mat_total.append(0)
+                mat_vis.append(0)
+            out.append(i)
+        return np.asarray(out, dtype=np.int64)
+
     for obj in objects:
         me = obj.data
         if not me.is_editmode:
@@ -1116,27 +1348,53 @@ def _extract(objects, sync, want_sel, want_td=False, reuse=False):
         A = _object_arrays(obj, want_td, reuse)
         if A is None:
             continue
+        fm = _face_materials(A, material_ids(_material_keys(obj)))
         vis = ~A.f_hide if sync else (~A.f_hide & A.f_sel)  # faces shown in the UV editor
+        for counts, faces in ((mat_total, fm), (mat_vis, fm[vis])):
+            for i, c in enumerate(np.bincount(faces, minlength=len(counts)).tolist()):
+                counts[i] += c
         S = _shells(A, vis)
         if not S.fidx.size:
             continue
         geo.nfaces += int(S.fidx.size)
         gaps.append(_gap_pieces(S, A, _sel_kind(want_sel, sync, A.sync_valid)))
-        if want_td:
-            tds.append(_td_pieces(S, A, obj.matrix_world))
+        p = _shell_pieces(S, A, obj.matrix_world, fm[S.fidx], want_td, want_td and want_orient)
+        p["obj"] = len(geo.obj_names)
+        shs.append(p)
+        geo.obj_names.append(obj.name)
+        geo.obj_scale.append(tuple(obj.scale))
 
-    if tds:
-        base = np.cumsum([0] + [t["nshell"] for t in tds])
-        geo.td_nshells = int(base[-1])
-        geo.td_uv_area = np.concatenate([t["uv_area"] for t in tds])
-        geo.td_world_area = np.concatenate([t["world_area"] for t in tds])
-        geo.td_anchor = np.concatenate([t["anchor"] for t in tds])
-        geo.td_tri_uv = np.concatenate([t["tri_uv"] for t in tds])
-        geo.td_tri_shell = np.concatenate([t["tri_shell"] + b for t, b in zip(tds, base[:-1])])
+    geo.mat_keys = list(mat_id)
+    geo.mat_total = np.asarray(mat_total, dtype=np.int64)
+    geo.mat_vis = np.asarray(mat_vis, dtype=np.int64)
+    if not shs:
+        return geo
+    base = np.cumsum([0] + [p["nshell"] for p in shs])
+    n = geo.sh_n = int(base[-1])
+    geo.sh_obj = np.repeat(np.asarray([p["obj"] for p in shs], dtype=np.int64), np.diff(base))
+    geo.sh_mat = np.concatenate([p["mat"] for p in shs])
+    geo.sh_anchor = np.concatenate([p["anchor"] for p in shs])
+    geo.sh_gid = np.full(n, -1, dtype=np.int64)
+    if want_td:
+        geo.td_nshells = n
+        geo.td_uv_area = np.concatenate([p["uv_area"] for p in shs])
+        geo.td_world_area = np.concatenate([p["world_area"] for p in shs])
+        geo.td_anchor = geo.sh_anchor
+        geo.td_tri_uv = np.concatenate([p["tri_uv"] for p in shs])
+        geo.td_tri_shell = np.concatenate([p["tri_shell"] + b for p, b in zip(shs, base[:-1])])
+    if want_td and want_orient:
+        geo.sh_orient = np.concatenate([p["orient"] for p in shs])
+        geo.sh_axis = np.concatenate([p["axis"] for p in shs])
+    else:
+        geo.sh_orient = np.full((n, 2), np.nan)
+        geo.sh_axis = np.zeros(n, dtype=np.int8)
 
     S = int(sum(g["count"].size for g in gaps))
     if S == 0:
         return geo
+    geo.gap_shell = np.concatenate([g["shells"] + b for g, b in zip(gaps, base[:-1])]).astype(np.int64)
+    geo.sh_gid[geo.gap_shell] = np.arange(S)
+    geo.shell_mat = geo.sh_mat[geo.gap_shell]
     gbase = np.cumsum([0] + [g["count"].size for g in gaps])
     geo.seg_a = np.concatenate([g["seg_a"] for g in gaps])
     geo.seg_b = np.concatenate([g["seg_b"] for g in gaps])
@@ -1487,7 +1745,8 @@ class _Measurement:
 
 def _shell_candidates(sh, lo, hi, A, B, L, seg_shell, tile_key=None):
     """Sorted pairs (row k, segment j): border segments of shells other than sh[k]
-    (in the same tile when tile_key is given) whose bounding box meets [lo[k], hi[k]]."""
+    (in the same group - tile and / or material - when tile_key is given) whose bounding
+    box meets [lo[k], hi[k]]."""
     M = len(A)
     cell = max(0.5 * float(np.median((hi - lo).max(axis=1))), float(np.median(L)),
                float(L.sum()) / MAX_PIECES, 1e-9)
@@ -1636,12 +1895,13 @@ def _border_distances(P3, N3, edges, cand_k, cand_j, A, D, R):
     return dist, F, axis
 
 
-def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
+def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False, same_mat=False):
     m = _Measurement()
     S = geo.nshells
     m.shells_total = S
     if S == 0:
         return m
+    mat = geo.shell_mat if same_mat and geo.shell_mat.size == S else None
     scale = np.array((float(W), float(H)))
     A = geo.seg_a * scale
     B = geo.seg_b * scale
@@ -1655,6 +1915,9 @@ def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
     R = max(0.0, float(radius))
     n = max(1, int(points))
     tile_key = ((geo.tile[:, 0] + _TILE_OFF) * _TILE_MUL + geo.tile[:, 1] + _TILE_OFF) if tiles else None
+    group = tile_key  # gaps are measured only within a group: same tile and / or same material
+    if mat is not None:
+        group = mat if group is None else group * (int(mat.max()) + 1) + mat
 
     # evenly spaced points along each shell's whole border (all loops), shifted along it
     cum0 = np.concatenate(([0.0], np.cumsum(L)))
@@ -1682,6 +1945,9 @@ def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
         end = np.minimum(2.0 * PX_EPS / Ls[g], 0.5)
         probe = A[g] + D[g] * np.clip(f, end, 1.0 - end)[:, None] + inward[g] * PX_EPS
         hp, hs = _probe_hits(probe, s_of, _shell_grid(bmin, bmax), bmin, bmax, A, B, _slopes(A, B), off)
+        if mat is not None and hp.size:  # shells of other materials use another texture
+            keep = mat[s_of[hp]] == mat[hs]
+            hp, hs = hp[keep], hs[keep]
         ov = np.zeros(P.shape[0], dtype=bool)
         if hp.size:
             ov[hp] = True
@@ -1693,7 +1959,7 @@ def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
         # 2) gap: nearest border point of another shell within the radius, in front of this border
         P3 = P.reshape(-1, n, 2)
         N3 = (-inward[g]).reshape(-1, n, 2)
-        ck, cj = _shell_candidates(sh, bmin[sh] - R, bmax[sh] + R, A, B, L, seg_shell, tile_key)
+        ck, cj = _shell_candidates(sh, bmin[sh] - R, bmax[sh] + R, A, B, L, seg_shell, group)
         if R > 0.0:
             dist, Q, j = _nearest_batched(P3, N3, ck, cj, A, D, L, R)
             dist, Q, j = dist.ravel(), Q.reshape(-1, 2), j.ravel()
@@ -1737,6 +2003,8 @@ def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
     for (s, c), (label_uv, cross_uv) in geo.pairs.items():
         if selected_only and not (geo.shell_sel[s] or geo.shell_sel[c]):
             continue
+        if mat is not None and mat[s] != mat[c]:
+            continue
         overlapping.add((s, c))
         if len(cross_uv):
             marks.append(cross_uv)
@@ -1766,15 +2034,16 @@ def _measure(geo, W, H, points, shift, radius, selected_only, tiles=False):
 # Cache management
 # ---------------------------------------------------------------------------
 
-def _geometry_signature(objects, sync, want_sel, want_td=False):
+def _geometry_signature(objects, sync, want_sel, want_td=False, want_orient=False):
     parts = []
     for obj in objects:
         bm = bmesh.from_edit_mesh(obj.data)
         uvl = bm.loops.layers.uv.active
         parts.append((obj.data.as_pointer(), len(bm.verts), len(bm.faces),
                       uvl.name if uvl is not None else "",
-                      tuple(tuple(r) for r in obj.matrix_world) if want_td else None))
-    return (sync, want_sel, want_td, tuple(parts))
+                      tuple(tuple(r) for r in obj.matrix_world) if want_td else None,
+                      tuple(_material_keys(obj)), obj.name))
+    return (sync, want_sel, want_td, want_orient, tuple(parts))
 
 
 def _redraw_timer():
@@ -1792,10 +2061,10 @@ def _schedule_redraw(delay):
         pass
 
 
-def _ensure_geometry(objects, sync, want_sel, want_td=False):
+def _ensure_geometry(objects, sync, want_sel, want_td=False, want_orient=False):
     """(geometry, stale). Heavy meshes keep the previous result until edits pause."""
     st = _State
-    sig = _geometry_signature(objects, sync, want_sel, want_td)
+    sig = _geometry_signature(objects, sync, want_sel, want_td, want_orient)
     if st.geo is not None and sig == st.geo_sig:
         if not st.geo_dirty:
             return st.geo, False
@@ -1805,7 +2074,7 @@ def _ensure_geometry(objects, sync, want_sel, want_td=False):
                 _schedule_redraw(wait + 0.01)
                 return st.geo, True
     t0 = time.perf_counter()
-    st.geo = _extract(objects, sync, want_sel, want_td, reuse=True)
+    st.geo = _extract(objects, sync, want_sel, want_td, reuse=True, want_orient=want_orient)
     st.last_geo_ms = (time.perf_counter() - t0) * 1000.0
     st.geo_sig = sig
     st.geo_dirty = False
@@ -1818,11 +2087,18 @@ def _ensure_geometry(objects, sync, want_sel, want_td=False):
     return st.geo, False
 
 
+def _uv_geometry(scene, st, objects):
+    """The UV editor's shells (one cache for the overlay and the panels): selection and
+    texel density always, orientation while the arrows are shown."""
+    return _ensure_geometry(objects, bool(scene.tool_settings.use_uv_select_sync), True, True,
+                            bool(st.info_show and st.show_orientation))
+
+
 def _ensure_measurement(geo, W, H, s):
     """(measurement, stale). Heavy layouts re-measure once a dragged slider pauses."""
     st = _State
     key = (st.geo_version, W, H, int(s.points), round(float(s.shift), 4),
-           round(float(s.search_px), 4), bool(s.selected_only), bool(s.tile_border))
+           round(float(s.search_px), 4), bool(s.selected_only), bool(s.tile_border), bool(s.same_material))
     hit = st.meas_cache.pop(key, None)
     if hit is not None:
         st.meas_cache[key] = hit  # most recently used last
@@ -1837,7 +2113,8 @@ def _ensure_measurement(geo, W, H, s):
             _schedule_redraw(wait + 0.01)
             return st.meas, True
     t0 = time.perf_counter()
-    meas = _measure(geo, W, H, s.points, s.shift / 100.0, s.search_px, s.selected_only, s.tile_border)
+    meas = _measure(geo, W, H, s.points, s.shift / 100.0, s.search_px, s.selected_only, s.tile_border,
+                    s.same_material)
     st.last_meas_ms = (time.perf_counter() - t0) * 1000.0
     st.meas_version += 1
     meas.version = st.meas_version
@@ -1846,6 +2123,190 @@ def _ensure_measurement(geo, W, H, s):
     st.pending_key = None
     _cache_put(st.meas_cache, key, meas)
     return meas, False
+
+
+# ---------------------------------------------------------------------------
+# Shell data for the panels, the material list and Low / High auto-fill
+# ---------------------------------------------------------------------------
+#
+# Draw callbacks publish per-shell densities and materials here. Scene properties (the
+# material list, auto-filled Low / High) must not be written while drawing, so those
+# writes are queued for a timer.
+
+class _Published:
+    __slots__ = ("key", "mode", "objects", "td", "k", "mat", "mat_keys", "mat_total", "mat_vis", "stats",
+                 "tmin", "tmax")
+
+
+def _material_label(key):
+    return key if key else NO_MATERIAL
+
+
+def _published(key, mode, objects, td, k, mat, mat_keys, mat_total, mat_vis):
+    """`td` in px/m for the density factor `k` (_td_factor) of the publishing view."""
+    p = _Published()
+    p.key, p.mode, p.objects = key, mode, objects
+    p.td = np.asarray(td, dtype=np.float64)
+    p.k = float(k)
+    p.mat = np.asarray(mat, dtype=np.int64)
+    p.mat_keys = list(mat_keys)
+    p.mat_total = np.asarray(mat_total, dtype=np.int64)
+    p.mat_vis = np.asarray(mat_vis, dtype=np.int64)
+    nm = len(p.mat_keys)
+    ok = np.isfinite(p.td)
+    counts = np.bincount(p.mat, minlength=nm) if p.mat.size else np.zeros(nm, dtype=np.int64)
+    lo = np.full(nm, np.inf)
+    hi = np.full(nm, -np.inf)
+    if ok.any():
+        np.minimum.at(lo, p.mat[ok], p.td[ok])
+        np.maximum.at(hi, p.mat[ok], p.td[ok])
+    # per material: (shells shown, lowest density, highest density, faces, faces shown)
+    p.stats = {k: (int(counts[i]), float(lo[i]) if np.isfinite(lo[i]) else None,
+                   float(hi[i]) if np.isfinite(hi[i]) else None, int(p.mat_total[i]), int(p.mat_vis[i]))
+               for i, k in enumerate(p.mat_keys)}
+    p.tmin = float(p.td[ok].min()) if ok.any() else None
+    p.tmax = float(p.td[ok].max()) if ok.any() else None
+    return p
+
+
+def _checked_keys(st):
+    return tuple(sorted(it.key for it in st.materials if it.checked))
+
+
+def _td_range_of(pub, checked):
+    """(lowest, highest) density of the shells in the checked material sets (all shells when
+    none is checked), or None."""
+    if pub is None or not pub.td.size:
+        return None
+    mask = np.isfinite(pub.td)
+    if checked:
+        ids = [i for i, k in enumerate(pub.mat_keys) if k in set(checked)]
+        mask &= np.isin(pub.mat, ids)
+    if not mask.any():
+        return None
+    vals = pub.td[mask]
+    return float(vals.min()), float(vals.max())
+
+
+def _auto_key(scene, st, pub, checked):
+    """What an auto-fill depends on, and the density factor it fills for. Densities are
+    filled for the texture size used by the 3D view, the same for every editor, so two UV
+    editors showing different images can't take turns refilling."""
+    Wc, Hc, _src = _resolve_resolution_3d(st)
+    kc = _td_factor(Wc, Hc, _unit_scale(scene))
+    return (pub.mode, pub.objects, checked, round(kc, 6)), kc
+
+
+def _auto_range(pub, checked, kc):
+    """(low, high) of the checked sets for the density factor kc, or None."""
+    rng = _td_range_of(pub, checked)
+    if rng is None or not pub.k > 0.0:
+        return None
+    f = kc / pub.k
+    return rng[0] * f, rng[1] * f
+
+
+def _queue(scene, what, value):
+    _State.pending[(scene.name, what)] = value
+    try:
+        if not bpy.app.timers.is_registered(_apply_pending):
+            bpy.app.timers.register(_apply_pending, first_interval=0.0)
+    except Exception:
+        pass
+
+
+def _sync_material_items(st, keys):
+    """Make the material list show `keys`, keeping the checked state and the active row."""
+    items = st.materials
+    checked = {it.key for it in items if it.checked}
+    active = items[st.material_index].key if 0 <= st.material_index < len(items) else None
+    items.clear()
+    for k in keys:
+        it = items.add()
+        it.key = k
+        it.name = _material_label(k)
+        if k in checked:
+            it.checked = True
+    st.material_index = keys.index(active) if active in keys else 0
+
+
+def _apply_pending():
+    """Timer: scene property writes queued by draw callbacks."""
+    pending, _State.pending = _State.pending, {}
+    for (scene_name, what), value in pending.items():
+        scene = bpy.data.scenes.get(scene_name)
+        st = getattr(scene, "uv_gap_overlay", None) if scene is not None else None
+        if st is None:
+            continue
+        try:
+            if what == "materials":
+                if [it.key for it in st.materials] != list(value):
+                    _sync_material_items(st, list(value))
+            elif what == "fill":
+                st.td_low_m, st.td_high_m = value
+                if st.settings_version < 140:
+                    st.settings_version = 140
+        except Exception:
+            _report("could not update the settings", traceback.format_exc())
+    _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+    return None
+
+
+def _after_publish(scene, st, pub):
+    """Keep the material list in step with the shown objects, and auto-fill Low / High when
+    the checked material sets, the objects, the texture size or the unit scale changed."""
+    shown = [k for k, (_n, _lo, _hi, faces, _fv) in pub.stats.items() if faces > 0]
+    shown.sort(key=lambda k: (k == "", _material_label(k).lower()))
+    if [it.key for it in st.materials] != shown:
+        _queue(scene, "materials", tuple(shown))
+    if st.td_auto_range and (st.td_show or st.td_show_3d):  # only while the colors are shown
+        checked = _checked_keys(st)
+        fkey, kc = _auto_key(scene, st, pub, checked)
+        if fkey != _State.auto_key:
+            rng = _auto_range(pub, checked, kc)
+            if rng is not None:
+                _State.auto_key = fkey
+                if abs(rng[0] - st.td_low_m) > 1e-6 * max(1.0, rng[0]) or \
+                        abs(rng[1] - st.td_high_m) > 1e-6 * max(1.0, rng[1]):
+                    _queue(scene, "fill", rng)
+
+
+def _publish_edit(scene, st, geo, W, H, objects):
+    """Publish the UV editor's shells (Edit Mode)."""
+    scale = _unit_scale(scene)
+    key = ('EDIT', _State.geo_version, W, H, scale)
+    pub = _State.pub
+    if pub is None or pub.key != key:
+        td = _geo_td(geo, W, H, scale) if geo.td_nshells else np.full(geo.sh_n, np.nan)
+        pub = _State.pub = _published(key, 'EDIT', tuple(sorted(o.name_full for o in objects)), td,
+                                      _td_factor(W, H, scale), geo.sh_mat, geo.mat_keys, geo.mat_total,
+                                      geo.mat_vis)
+    _after_publish(scene, st, pub)
+    return pub
+
+
+def _panel_pub(context):
+    """Published shells for a panel. In Edit Mode they are computed right here if no UV editor
+    has done it yet (reading is safe from any draw callback); in Object Mode they come from
+    the 3D view's texel density overlay."""
+    scene = context.scene
+    st = scene.uv_gap_overlay
+    edit = context.mode == 'EDIT_MESH'
+    if edit:
+        objects = _edit_mesh_objects(context)
+        if objects:
+            try:
+                geo, _stale = _uv_geometry(scene, st, objects)
+                space = context.space_data
+                if space is not None and space.type == 'IMAGE_EDITOR':
+                    W, H, _src = _resolve_resolution(st, space)
+                else:
+                    W, H, _src = _resolve_resolution_3d(st)
+                _publish_edit(scene, st, geo, W, H, objects)
+            except Exception:
+                _report("panel data", traceback.format_exc())
+    pub = _State.pub
+    return pub if pub is not None and pub.mode == ('EDIT' if edit else 'OBJECT') else None
 
 
 # ---------------------------------------------------------------------------
@@ -1870,16 +2331,91 @@ def _builtin(kind):
     return "", None
 
 
-def _batch(shader, prim, pos, col):
+def _batch_attrs(shader, prim, attrs):
     """Batch from float32 arrays (fast buffer path), falling back to Python lists."""
     if _State.numpy_buffers:
         try:
-            return batch_for_shader(shader, prim, {
-                "pos": np.ascontiguousarray(pos, dtype=np.float32),
-                "color": np.ascontiguousarray(col, dtype=np.float32)})
+            return batch_for_shader(shader, prim, {k: np.ascontiguousarray(v, dtype=np.float32)
+                                                   for k, v in attrs.items()})
         except Exception:
             _State.numpy_buffers = False
-    return batch_for_shader(shader, prim, {"pos": pos.tolist(), "color": col.tolist()})
+    return batch_for_shader(shader, prim, {k: np.asarray(v).tolist() for k, v in attrs.items()})
+
+
+def _batch(shader, prim, pos, col):
+    return _batch_attrs(shader, prim, {"pos": pos, "color": col})
+
+
+# Texel density colors computed on the GPU from a per-vertex density and the thresholds as
+# uniforms: changing Low / Needed / High, the texture size, the unit scale or the opacity
+# rebuilds nothing. Same ramp as _td_rgb (red - yellow - green - cyan - blue, gray: no area).
+_TD_VERT = """
+void main()
+{
+  gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);
+  vec3 c = vec3(0.5);
+  if (tdens >= 0.0) {
+    float low = u_thr.x;
+    float needed = u_thr.y;
+    float high = u_thr.z;
+    float td = tdens * u_thr.w;
+    float t = 1.0;
+    if (td < needed) {
+      t = (needed > low) ? clamp((td - low) / (needed - low), 0.0, 1.0) : 0.0;
+    }
+    else if (td > needed) {
+      t = (high > needed) ? 1.0 + clamp((td - needed) / (high - needed), 0.0, 1.0) : 2.0;
+    }
+    float h = 2.0 * t;
+    c = clamp(vec3(abs(h - 3.0) - 1.0, 2.0 - abs(h - 2.0), 2.0 - abs(h - 4.0)), 0.0, 1.0);
+  }
+  v_color = vec4(c, u_alpha);
+}
+"""
+_TD_FRAG = """
+void main()
+{
+  frag_color = v_color;
+}
+"""
+
+
+def _td_shader():
+    """The texel density shader, or None where custom shaders are unavailable (per-vertex
+    colors are used then). Created on first use, inside a draw callback."""
+    sh = _State.td_shader
+    if sh is None:
+        sh = False
+        try:
+            iface = gpu.types.GPUStageInterfaceInfo("uvgap_td_iface")
+            iface.smooth('VEC4', "v_color")
+            info = gpu.types.GPUShaderCreateInfo()
+            info.push_constant('MAT4', "ModelViewProjectionMatrix")
+            info.push_constant('VEC4', "u_thr")  # low, needed, high (px/m), px/m per unit of `tdens`
+            info.push_constant('FLOAT', "u_alpha")
+            info.vertex_in(0, 'VEC3', "pos")
+            info.vertex_in(1, 'FLOAT', "tdens")
+            info.vertex_out(iface)
+            info.fragment_out(0, 'VEC4', "frag_color")
+            info.vertex_source(_TD_VERT)
+            info.fragment_source(_TD_FRAG)
+            sh = gpu.shader.create_from_info(info)
+        except Exception:
+            _report("texel density shader unavailable, using per-vertex colors", traceback.format_exc())
+            sh = False
+        _State.td_shader = sh
+    return sh or None
+
+
+def _td_shader_setup(sh, thr, k, alpha):
+    sh.bind()
+    sh.uniform_float("u_thr", (float(thr[0]), float(thr[1]), float(thr[2]), float(k)))
+    sh.uniform_float("u_alpha", float(alpha))
+
+
+def _set_mvp(sh):
+    sh.uniform_float("ModelViewProjectionMatrix",
+                     gpu.matrix.get_projection_matrix() @ gpu.matrix.get_model_view_matrix())
 
 
 def _segment_verts(P, Q):
@@ -1971,9 +2507,28 @@ def _visible_segments(P, Q, rw, rh, margin):
 
 
 class _Labels:
-    """Label text, color and size in priority order, plus line colors; rebuilt only when
-    the measurement or the style changes."""
-    __slots__ = ("anchor", "lifted", "text", "rgb", "width", "th", "gap_rgb", "border_rgb")
+    """Label boxes in priority order - one or more text lines, optionally an arrow (per-shell
+    info blocks) - plus line colors; rebuilt only when the measurement or the style changes.
+
+    Per label: anchor (UV), lifted, nlines, width (content, px), icon (UV direction, NaN: none),
+    icon_rgb, icw (arrow column width: as tall as the block, at least iw). Per text line: text,
+    rgb, line_of (label), row. th: text height, lh: line pitch."""
+    __slots__ = ("anchor", "lifted", "nlines", "width", "icon", "icon_rgb", "icw",
+                 "text", "rgb", "line_of", "row", "th", "lh", "iw", "gap_rgb", "border_rgb")
+
+
+SCALE_RGB = (1.0, 0.62, 0.25)      # object scale note
+AXIS_RGB = {1: (0.35, 0.62, 1.0),  # orientation arrow: +Z (blue, as Blender's Z axis)
+            2: (0.45, 0.88, 0.35)}  # +Y on flat-lying shells (green)
+
+
+def _fmt_scale(s):
+    """'2' for a uniform scale, '1 x 2 x 1' otherwise; None when the scale is 1."""
+    if all(abs(c - 1.0) <= 1e-5 for c in s):
+        return None
+    parts = [("%.3f" % c).rstrip("0").rstrip(".") for c in s]
+    parts = ["0" if p in ("-0", "") else p for p in parts]
+    return parts[0] if parts[0] == parts[1] == parts[2] else " × ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1990,9 +2545,33 @@ def _td_values(uv_area, world_area, W, H, scale):
     return td
 
 
+def _td_base(uv_area, world_area):
+    """sqrt(UV area / world area) per shell, the texture-independent part of the texel
+    density: px/m = this * sqrt(W * H) / unit scale. -1 where a shell has no 3D area."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        b = np.sqrt(np.asarray(uv_area, dtype=np.float64) / np.asarray(world_area, dtype=np.float64))
+    b[~np.isfinite(b)] = -1.0
+    return b
+
+
+def _td_factor(W, H, scale):
+    return float(np.sqrt(float(W) * float(H))) / float(scale)
+
+
 def _td_thresholds(st):
     """(low, needed, high) in px/m."""
     return float(st.td_low_m), float(st.td_needed_m), float(st.td_high_m)
+
+
+def _td_range_bounds(td, f0, f1):
+    """(lo, hi) in px/m: fractions f0..f1 of the lowest..highest finite density; None if none."""
+    ok = td[np.isfinite(td)]
+    if not ok.size:
+        return None
+    tmin, tmax = float(ok.min()), float(ok.max())
+    span = tmax - tmin
+    eps = max(span, abs(tmax), 1e-12) * 1e-9  # the shells at the ends are always in range
+    return tmin + span * float(f0) - eps, tmin + span * float(f1) + eps
 
 
 def _td_rgb(td, low, needed, high):
@@ -2048,7 +2627,23 @@ def _geo_td(geo, W, H, scale):
 
 def _td_fill_batch(geo, td, thr, alpha):
     """Texel density fill of the UV editor, built in UV space once per change and drawn
-    through the view matrix."""
+    through the view matrix. Returns (batch, shader, uses_td_shader): with the texel density
+    shader the batch holds densities and survives threshold / texture / opacity changes."""
+    sh = _td_shader()
+    if sh is not None:
+        key = ('shader', _State.geo_version)
+        hit = _State.td_fill.get(key)
+        if hit is None:
+            batch = None
+            if geo.td_tri_uv.size:
+                T = geo.td_tri_uv.reshape(-1, 2)
+                pos = np.zeros((T.shape[0], 3), dtype=np.float32)
+                pos[:, :2] = T
+                dens = np.repeat(_td_base(geo.td_uv_area, geo.td_world_area)[geo.td_tri_shell], 3)
+                batch = _batch_attrs(sh, 'TRIS', {"pos": pos, "tdens": dens})
+            hit = (batch, sh, None)
+            _cache_put(_State.td_fill, key, hit, size=2)
+        return hit[0], hit[1], True
     key = (_State.geo_version, id(td), thr, round(alpha, 4))
     hit = _State.td_fill.get(key)
     if hit is None:
@@ -2064,49 +2659,101 @@ def _td_fill_batch(geo, td, thr, alpha):
             batch = _batch(sh, 'TRIS', pos, col)
         hit = (batch, sh, td)  # keeps td alive, so id(td) stays unique while cached
         _cache_put(_State.td_fill, key, hit, size=2)
-    return hit[0], hit[1]
+    return hit[0], hit[1], False
 
 
-def _build_labels(geo, meas, st, fsize, td_info):
+def _build_labels(geo, meas, st, fsize, td_info, info=None):
+    """`info`: (show object scale, show orientation arrows, show Flipped) for the per-shell info
+    blocks; by default Flipped follows the gap overlay and the other two are off."""
     lab = _Labels()
     blf.size(FONT_ID, fsize)
-    lab.th = float(blf.dimensions(FONT_ID, "0123456789")[1])
+    lab.th = th = float(blf.dimensions(FONT_ID, "0123456789")[1])
+    lab.lh = th * 1.45
+    lab.iw = th * 1.7
     c0 = np.array(st.color_zero[:], dtype=np.float64)
     c1 = np.array(st.color_min[:], dtype=np.float64)
     c2 = np.array(st.color_needed[:], dtype=np.float64)
     c_ov = np.array(st.color_overlap[:], dtype=np.float64)
-    c_fl = np.array(st.color_flipped[:], dtype=np.float64)
+    c_fl = tuple(float(c) for c in st.color_flipped[:])
     if meas is not None:
         lab.gap_rgb = _gradient(meas.dist, st.min_px, st.needed_px, c0, c1, c2)
         lab.border_rgb = _gradient(meas.bdist, st.border_min_px, st.border_needed_px, c0, c1, c2)
     else:
         lab.gap_rgb = lab.border_rgb = np.empty((0, 3))
+    if info is None:
+        info = (False, False, meas is not None and bool(st.show_flipped))
+    show_scale, show_orient, show_flip = info
 
-    # problems first (tile crossings, overlaps, flipped shells), then texel densities,
-    # then distances by severity
-    anchors, lifted, texts, colors = [], [], [], []
+    # problems first (tile crossings, overlaps), then the shells' info blocks (those with a
+    # warning first), then distances by severity
+    anchors, lifted, icons, icon_rgb, lines = [], [], [], [], []
 
     def add(pts, text, rgb, lift):
-        if len(pts):
-            anchors.append(pts)
-            lifted.append(np.full(len(pts), 1.0 if lift else 0.0))
-            texts.extend([text] * len(pts) if isinstance(text, str) else text)
-            colors.append(np.tile(rgb, (len(pts), 1)) if np.ndim(rgb) == 1 else rgb)
+        k = len(pts)
+        if k:
+            anchors.append(np.asarray(pts, dtype=np.float64).reshape(-1, 2))
+            lifted.append(np.full(k, 1.0 if lift else 0.0))
+            icons.append(np.full((k, 2), np.nan))
+            icon_rgb.append(np.zeros((k, 3)))
+            rgbs = (np.tile(rgb, (k, 1)) if np.ndim(rgb) == 1 else np.asarray(rgb)).tolist()
+            txts = [text] * k if isinstance(text, str) else text
+            lines.extend([[(t, tuple(c))] for t, c in zip(txts, rgbs)])
 
     if meas is not None:
         add(meas.tile_label_uv, "Crosses tile", c_ov, True)
         add(meas.pair_label_uv, "Overlap", c_ov, True)
         add(meas.ov_uv, "Overlap", c_ov, True)
-        if st.show_flipped and geo.flipped.any():
-            fl = np.flatnonzero(geo.flipped)
-            add((geo.bmin[fl] + geo.bmax[fl]) * 0.5, "Flipped", c_fl, False)
 
-    if td_info is not None:
-        td, unit, factor, thr = td_info
-        ok = np.flatnonzero(np.isfinite(td))
-        if ok.size:
-            add(geo.td_anchor[ok], [_fmt_td(v, unit) for v in (td[ok] * factor).tolist()],
-                _td_rgb(td[ok], *thr) * 0.55 + 0.45, False)  # lighter: readable on the dark box
+    n = geo.sh_n
+    if n:
+        has = np.zeros(n, dtype=bool)
+        warn = np.zeros(n, dtype=bool)
+        td_ok = np.zeros(n, dtype=bool)
+        td_txt = td_col = None
+        if td_info is not None and len(td_info[0]) == n:
+            td, unit, factor, thr = td_info
+            td_ok = np.isfinite(td)
+            ok = np.flatnonzero(td_ok)
+            td_txt = dict(zip(ok.tolist(), [_fmt_td(v, unit) for v in (td[ok] * factor).tolist()]))
+            td_col = dict(zip(ok.tolist(), map(tuple, (_td_rgb(td[ok], *thr) * 0.55 + 0.45).tolist())))
+            has |= td_ok  # lighter colors: readable on the dark box
+        scale_on = np.zeros(n, dtype=bool)
+        otxt = []
+        if show_scale and geo.obj_scale:
+            otxt = [_fmt_scale(s) for s in geo.obj_scale]
+            scale_on = np.asarray([t is not None for t in otxt], dtype=bool)[geo.sh_obj]
+            has |= scale_on
+            warn |= scale_on
+        flip = np.zeros(n, dtype=bool)
+        if show_flip and geo.flipped.size and geo.gap_shell.size == geo.flipped.size:
+            flip[geo.gap_shell] = geo.flipped
+            has |= flip
+            warn |= flip
+        arrow = (geo.sh_axis > 0) if show_orient and geo.sh_axis.size == n else np.zeros(n, dtype=bool)
+        has |= arrow
+        order = np.concatenate((np.flatnonzero(has & warn), np.flatnonzero(has & ~warn)))
+        if order.size:
+            obj = geo.sh_obj.tolist()
+            for i in order.tolist():
+                ln = []
+                if td_ok[i]:
+                    ln.append((td_txt[i], td_col[i]))
+                if scale_on[i]:
+                    ln.append(("Scale " + otxt[obj[i]], SCALE_RGB))
+                if flip[i]:
+                    ln.append(("Flipped", c_fl))
+                lines.append(ln)
+            k = order.size
+            anchors.append(geo.sh_anchor[order])
+            lifted.append(np.zeros(k))
+            ic = np.full((k, 2), np.nan)
+            icr = np.zeros((k, 3))
+            a = arrow[order]
+            if a.any():
+                ic[a] = geo.sh_orient[order][a]
+                icr[a] = np.asarray([AXIS_RGB[c] for c in geo.sh_axis[order][a].tolist()])
+            icons.append(ic)
+            icon_rgb.append(icr)
 
     if meas is not None:
         d_all = np.concatenate((meas.dist, meas.bdist))
@@ -2118,12 +2765,26 @@ def _build_labels(geo, meas, st, fsize, td_info):
             add(mids[order], [_fmt_px(x) for x in d_all[order].tolist()],
                 np.concatenate((lab.gap_rgb, lab.border_rgb))[order], False)
 
+    nlab = len(lines)
     lab.anchor = np.concatenate(anchors) if anchors else _EMPTY2
     lab.lifted = np.concatenate(lifted) if lifted else _EMPTY_F
-    lab.text = texts
-    lab.rgb = np.concatenate(colors) if colors else np.empty((0, 3))
-    widths = {t: float(blf.dimensions(FONT_ID, t)[0]) for t in set(texts)}
-    lab.width = np.array([widths[t] for t in texts], dtype=np.float64)
+    lab.icon = np.concatenate(icons) if icons else _EMPTY2
+    lab.icon_rgb = np.concatenate(icon_rgb) if icon_rgb else np.empty((0, 3))
+    counts = np.asarray([len(x) for x in lines], dtype=np.int64)
+    lab.nlines = counts
+    flat = [t for x in lines for t in x]
+    lab.text = [t for t, _c in flat]
+    lab.rgb = np.asarray([c for _t, c in flat], dtype=np.float64).reshape(-1, 3)
+    lab.line_of = np.repeat(np.arange(nlab, dtype=np.int64), counts)
+    lab.row = np.arange(len(flat), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+    widths = {t: float(blf.dimensions(FONT_ID, t)[0]) for t in set(lab.text)}
+    maxw = np.zeros(nlab)
+    if flat:
+        np.maximum.at(maxw, lab.line_of, np.asarray([widths[t] for t in lab.text], dtype=np.float64))
+    has_icon = np.isfinite(lab.icon[:, 0]) if nlab else np.zeros(0, dtype=bool)
+    tall = th + (np.maximum(counts, 1) - 1) * lab.lh
+    lab.icw = np.where(has_icon, np.maximum(lab.iw, tall), 0.0)
+    lab.width = maxw + lab.icw + np.where(has_icon & (counts > 0), th * 0.35, 0.0)
     return lab
 
 
@@ -2137,13 +2798,15 @@ def _clashes(grid, gx0, gx1, gy0, gy1, x0, y0, x1, y1):
 
 
 def _place_labels(lab, anchor_px, lift, pad, rw, rh, declutter):
-    """Indices of labels to draw (priority order) plus their anchors and boxes."""
+    """Labels to draw (indices, priority order) and, per label, its box, the left end of its
+    text, its first baseline and its center."""
     ax = anchor_px[:, 0]
     ay = anchor_px[:, 1] + lab.lifted * lift
     hw = lab.width * 0.5
     th = lab.th
+    tall = th + (np.maximum(lab.nlines, 1) - 1) * lab.lh  # first line's top to last line's baseline
     x0, x1 = ax - hw - pad, ax + hw + pad
-    y0, y1 = ay - th * 0.8 - pad * 0.5, ay + th * 0.5 + pad
+    y0, y1 = ay - tall * 0.5 - th * 0.3 - pad * 0.5, ay + tall * 0.5 + pad
     idx = np.flatnonzero((x1 >= 0.0) & (x0 <= rw) & (y1 >= 0.0) & (y0 <= rh))
     if declutter and idx.size > 1:
         # coarse pass: the first label (by priority) in each label-sized screen cell
@@ -2169,21 +2832,29 @@ def _place_labels(lab, anchor_px, lift, pad, rw, rh, declutter):
                     grid.setdefault((gx, gy), []).append(rect)
             keep.append(i)
         idx = np.asarray(keep, dtype=np.int64)
-    return idx, ax, ay, np.column_stack((x0, y0, x1, y1))
+    tx = ax - hw + np.where(np.isfinite(lab.icon[:, 0]), lab.icw + th * 0.35, 0.0)
+    ty = ay + tall * 0.5 - th
+    return idx, np.column_stack((x0, y0, x1, y1)), tx, ty, ax, ay
 
 
-def _draw_texts(lab, idx, ax, ay, fsize, alpha, shadow):
+def _draw_texts(lab, idx, tx, ty, fsize, alpha, shadow):
+    placed = np.zeros(lab.nlines.size, dtype=bool)
+    placed[idx] = True
+    li = np.flatnonzero(placed[lab.line_of]) if lab.line_of.size else _EMPTY_I
+    if not li.size:
+        return
     blf.size(FONT_ID, fsize)
     if shadow:
         blf.enable(FONT_ID, blf.SHADOW)
         blf.shadow(FONT_ID, 3, 0.0, 0.0, 0.0, min(1.0, alpha))
         blf.shadow_offset(FONT_ID, 1, -1)
     try:
-        xs = (ax[idx] - lab.width[idx] * 0.5).tolist()
-        ys = (ay[idx] - lab.th * 0.5).tolist()
-        cols = lab.rgb[idx].tolist()
+        owner = lab.line_of[li]
+        xs = tx[owner].tolist()
+        ys = (ty[owner] - lab.row[li] * lab.lh).tolist()
+        cols = lab.rgb[li].tolist()
         text = lab.text
-        for k, i in enumerate(idx.tolist()):
+        for k, i in enumerate(li.tolist()):
             r, g, b = cols[k]
             blf.color(FONT_ID, r, g, b, alpha)
             blf.position(FONT_ID, xs[k], ys[k], 0.0)
@@ -2193,20 +2864,46 @@ def _draw_texts(lab, idx, ax, ay, fsize, alpha, shadow):
             blf.disable(FONT_ID, blf.SHADOW)
 
 
+def _arrow_verts(C, D, size):
+    """Triangles (shaft + head) of arrows centered on C, pointing along the unit vectors D,
+    `size` long (one value or one per arrow)."""
+    size = np.broadcast_to(np.asarray(size, dtype=np.float64), (C.shape[0],))[:, None]
+    N = np.column_stack((-D[:, 1], D[:, 0]))
+    tip = C + D * (size * 0.5)
+    neck = tip - D * (size * 0.45)
+    tail = C - D * (size * 0.5)
+    sw = N * np.maximum(0.8, size * 0.08)
+    hw = N * (size * 0.3)
+    pts = np.stack((tail + sw, tail - sw, neck - sw, tail + sw, neck - sw, neck + sw,
+                    neck + hw, neck - hw, tip), axis=1)
+    v = np.zeros((pts.shape[0] * 9, 3), dtype=np.float32)
+    v[:, :2] = pts.reshape(-1, 2)
+    return v
+
+
 class _Frame:
     """Everything drawn in region pixels for one view of the data: reused as long as the
     view (pan / zoom / size), the data and the style stay the same."""
-    __slots__ = ("under", "lines", "fills", "boxes", "idx", "ax", "ay")
+    __slots__ = ("hl", "under", "lines", "fills", "boxes", "icons", "idx", "tx", "ty")
 
 
-def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad):
+def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl=None):
     u0, v0, sx, sy = mapping
 
     def to_region(uv):
         return np.column_stack(((uv[:, 0] - u0) * sx, (uv[:, 1] - v0) * sy))
 
+    hl_p = []
     under_p, under_c = [], []
     lines_p, lines_c, fills_p, fills_c = [], [], [], []
+
+    # shells inside the texel density range: an outline under everything else
+    if hl is not None and hl.any() and geo.seg_shell.size:
+        seg = hl[geo.seg_shell]
+        P, Q = to_region(geo.seg_a[seg]), to_region(geo.seg_b[seg])
+        vis = _visible_segments(P, Q, rw, rh, margin)
+        if vis.any():
+            hl_p.append(_segment_verts(P[vis], Q[vis]))
 
     if meas is not None:
         ov_rgba = np.array(tuple(st.color_overlap) + (alpha,), dtype=np.float32)
@@ -2263,22 +2960,42 @@ def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margi
                     lines_c.append(np.tile(ov_rgba, (4 * X.shape[0], 1)))
 
     fr = _Frame()
-    fr.idx, fr.ax, fr.ay = _EMPTY_I, _EMPTY_F, _EMPTY_F
-    boxes = None
-    if lab.text:
-        fr.idx, fr.ax, fr.ay, boxes = _place_labels(lab, to_region(lab.anchor), lift, pad, rw, rh, st.declutter)
+    fr.idx, fr.tx, fr.ty = _EMPTY_I, _EMPTY_F, _EMPTY_F
+    boxes = ax = ay = None
+    if lab.nlines.size:
+        fr.idx, boxes, fr.tx, fr.ty, ax, ay = _place_labels(lab, to_region(lab.anchor), lift, pad, rw, rh,
+                                                            st.declutter)
     _lname, lsh = _builtin('line')
     _fname, fsh = _builtin('fill')
+    fr.hl = None
+    if hl_p and lsh is not None:
+        HL = np.concatenate(hl_p)
+        fr.hl = _batch(lsh, 'LINES', HL, np.tile(np.array((1.0, 1.0, 1.0, 0.9 * alpha), dtype=np.float32),
+                                                 (HL.shape[0], 1)))
     fr.under = (_batch(fsh, 'TRIS', np.concatenate(under_p), np.concatenate(under_c))
                 if under_p and fsh is not None else None)
     fr.lines = (_batch(lsh, 'LINES', np.concatenate(lines_p), np.concatenate(lines_c))
                 if lines_p and lsh is not None else None)
     fr.fills = (_batch(fsh, 'TRIS', np.concatenate(fills_p), np.concatenate(fills_c))
                 if fills_p and fsh is not None else None)
-    fr.boxes = None
+    fr.boxes = fr.icons = None
     if fr.idx.size and st.label_background and fsh is not None:
         bg = np.array((0.0, 0.0, 0.0, 0.85 * alpha), dtype=np.float32)
         fr.boxes = _batch(fsh, 'TRIS', _rect_verts(boxes[fr.idx]), np.tile(bg, (6 * fr.idx.size, 1)))
+    if fr.idx.size and fsh is not None:
+        sel = fr.idx[np.isfinite(lab.icon[fr.idx, 0])]
+        if sel.size:
+            D = np.column_stack((lab.icon[sel, 0] * sx, lab.icon[sel, 1] * sy))
+            dn = np.hypot(D[:, 0], D[:, 1])
+            good = dn > 0.0
+            sel, D, dn = sel[good], D[good], dn[good]
+            if sel.size:
+                C = np.column_stack((ax[sel] - (lab.width[sel] - lab.icw[sel]) * 0.5, ay[sel]))
+                rgba = np.empty((sel.size, 4), dtype=np.float32)
+                rgba[:, :3] = lab.icon_rgb[sel]
+                rgba[:, 3] = alpha
+                fr.icons = _batch(fsh, 'TRIS', _arrow_verts(C, D / dn[:, None], lab.icw[sel] * 0.9),
+                                  np.repeat(rgba, 9, axis=0))
     return fr
 
 
@@ -2317,60 +3034,84 @@ def _draw_overlay(context, region, st, geo, meas, W, H, stale):
     margin = 64.0 * ui
     pad = max(2.0, round(3.0 * ui))
 
+    scale = _unit_scale(context.scene)
+    td = _geo_td(geo, W, H, scale) if geo.td_nshells else None
     td_info = td_key = None
-    if st.td_show and geo.td_nshells:
-        scale = _unit_scale(context.scene)
-        td = _geo_td(geo, W, H, scale)
+    if st.td_show and td is not None:
         thr = _td_thresholds(st)
         td_info = (td, _TD_LABEL.get(st.td_unit, "px/m"), _TD_FACTOR.get(st.td_unit, 1.0), thr)
         td_key = (W, H, scale, st.td_unit, thr)
         _State.td_uv_stats = _td_stats(td, thr)
+    info = (bool(st.info_show and st.show_scale), bool(st.info_show and st.show_orientation),
+            bool(meas is not None and st.show_flipped))
+
+    hl = hl_key = None
+    if (st.td_range_highlight and td is not None and geo.gap_shell.size
+            and (st.td_sel_from > 0.0 or st.td_sel_to < 100.0)):
+        bounds = _td_range_bounds(td, st.td_sel_from / 100.0, st.td_sel_to / 100.0)
+        if bounds is not None:
+            with np.errstate(invalid='ignore'):
+                inside = (td >= bounds[0]) & (td <= bounds[1])
+            hl = inside[geo.gap_shell]
+            hl_key = (bounds, W, H, scale)
 
     key = (meas.version if meas is not None else None, _State.geo_version, round(fsize, 3),
-           bool(st.show_flipped), float(st.min_px), float(st.needed_px),
+           float(st.min_px), float(st.needed_px),
            float(st.border_min_px), float(st.border_needed_px),
            tuple(st.color_zero), tuple(st.color_min), tuple(st.color_needed),
-           tuple(st.color_overlap), tuple(st.color_flipped), td_key)
+           tuple(st.color_overlap), tuple(st.color_flipped), td_key, info)
     lab = _State.labels_cache.get(key)
     if lab is None:
-        lab = _build_labels(geo, meas, st, fsize, td_info)
+        lab = _build_labels(geo, meas, st, fsize, td_info, info)
         _cache_put(_State.labels_cache, key, lab)
 
     fkey = (mapping, rw, rh, key, alpha, lw, dot, xh, lift, margin, pad,
-            bool(st.declutter), bool(st.label_background))
+            bool(st.declutter), bool(st.label_background), bool(st.show_flipped), hl_key)
     rkey = region.as_pointer() if hasattr(region, "as_pointer") else id(region)
     hit = _State.frame.get(rkey)
     if hit is not None and hit[0] == fkey:
         fr = hit[1]
     else:
-        fr = _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad)
+        fr = _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl)
         _cache_put(_State.frame, rkey, (fkey, fr), size=8)
 
     gpu.state.blend_set('ALPHA')
     try:
         if td_info is not None:
             fill_alpha = max(0.0, min(1.0, float(st.td_fill_opacity))) * (0.35 if stale else 1.0)
-            batch, sh = _td_fill_batch(geo, td_info[0], td_info[3], fill_alpha)
+            batch, sh, shader_td = _td_fill_batch(geo, td_info[0], td_info[3], fill_alpha)
             if batch is not None:
                 with gpu.matrix.push_pop():  # UV -> region pixels
                     gpu.matrix.multiply_matrix(Matrix(((sx, 0.0, 0.0, -u0 * sx), (0.0, sy, 0.0, -v0 * sy),
                                                        (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))))
-                    sh.bind()
+                    if shader_td:
+                        _td_shader_setup(sh, td_info[3], _td_factor(W, H, scale), fill_alpha)
+                        _set_mvp(sh)
+                    else:
+                        sh.bind()
                     batch.draw(sh)
+        _draw_batch('line', fr.hl, lw + 2.0 * ui, rw, rh)
         _draw_batch('fill', fr.under)
         _draw_batch('line', fr.lines, lw, rw, rh)
         _draw_batch('fill', fr.fills)
         if fr.idx.size:
             _draw_batch('fill', fr.boxes)
-            _draw_texts(lab, fr.idx, fr.ax, fr.ay, fsize, alpha, shadow=not st.label_background)
+            _draw_batch('fill', fr.icons)
+            _draw_texts(lab, fr.idx, fr.tx, fr.ty, fsize, alpha, shadow=not st.label_background)
     finally:
         gpu.state.blend_set('NONE')
+
+
+def _uv_features_on(st):
+    """Anything to draw in the UV editor. Scale notes only join blocks shown for the gap or
+    texel density overlays; arrows can be shown on their own."""
+    return bool(st.show or st.td_show or (st.info_show and st.show_orientation))
 
 
 def _draw_main(context):
     scene = getattr(context, "scene", None)
     st = getattr(scene, "uv_gap_overlay", None) if scene is not None else None
-    if st is None or not (st.show or st.td_show):
+    if st is None or not _uv_features_on(st):
         return
     space = context.space_data
     if space is None or space.type != 'IMAGE_EDITOR' or getattr(space, "mode", None) != 'UV':
@@ -2384,11 +3125,11 @@ def _draw_main(context):
     objects = _edit_mesh_objects(context)
     if not objects:
         return
-    sync = bool(scene.tool_settings.use_uv_select_sync)
-    geo, stale_geo = _ensure_geometry(objects, sync, bool(st.selected_only), bool(st.td_show))
-    if geo.nshells == 0 and geo.td_nshells == 0:
-        return
+    geo, stale_geo = _uv_geometry(scene, st, objects)
     W, H, _src = _resolve_resolution(st, space)
+    _publish_edit(scene, st, geo, W, H, objects)
+    if geo.nshells == 0 and geo.sh_n == 0:
+        return
     meas, stale_meas = None, False
     if st.show and geo.nshells:
         meas, stale_meas = _ensure_measurement(geo, W, H, st)
@@ -2415,7 +3156,8 @@ TD3D_DEPTH_BIAS = 2.0e-5  # NDC depth offset toward the viewer, so the colors do
 class _TD3D:
     """Texel density data of one object for the 3D viewport (object space)."""
     __slots__ = ("gen", "build_ms", "last_used", "nshell", "uv_area", "face_shell", "face_nvec",
-                 "tri_co", "tri_shell", "color_key", "batch", "td")
+                 "tri_co", "tri_shell", "mat_keys", "shell_mat", "mat_faces",
+                 "m3", "stretch", "base", "version", "color_key", "batch", "td", "td_k")
 
 
 def _td3d_build(obj, depsgraph, edit):
@@ -2424,18 +3166,22 @@ def _td3d_build(obj, depsgraph, edit):
         if A is None:
             return None
         vis = ~A.f_hide
+        keys, lut = _material_sets(obj)
     else:  # the evaluated mesh, as drawn (modifiers included)
-        me = obj.evaluated_get(depsgraph).data
+        ob_eval = obj.evaluated_get(depsgraph)
+        me = ob_eval.data
         uvl = me.uv_layers.active if me is not None else None
         if uvl is None:
             return None
         A = _arrays_from_mesh(me, uvl.name, True)
         vis = np.ones(A.f_total.size, dtype=bool)
+        keys, lut = _material_sets(ob_eval)
     S = _shells(A, vis)
     e = _TD3D()
     e.nshell = S.nshell
     e.face_shell = S.face_shell
-    e.uv_area = np.bincount(S.face_shell, weights=np.abs(S.area2) * 0.5, minlength=S.nshell)
+    uv_abs = np.abs(S.area2) * 0.5
+    e.uv_area = np.bincount(S.face_shell, weights=uv_abs, minlength=S.nshell)
     e.face_nvec = _face_area_vectors(S, A)
     cmap = np.full(A.f_total.size, -1, dtype=np.int64)
     cmap[S.fidx] = np.arange(S.fidx.size)
@@ -2443,50 +3189,87 @@ def _td3d_build(obj, depsgraph, edit):
     keep = tc >= 0
     e.tri_co = A.co[A.loop_vert[A.tri_loops[keep]]].reshape(-1, 3).astype(np.float32)
     e.tri_shell = S.face_shell[tc[keep]]
-    e.color_key = e.batch = e.td = None
+    fm = lut[np.clip(A.f_mat[S.fidx], 0, lut.size - 1)]
+    e.mat_keys = keys
+    e.shell_mat = _dominant(S.face_shell, fm, uv_abs, S.nshell)
+    e.mat_faces = np.bincount(fm, minlength=len(keys))
+    e.m3 = e.stretch = e.base = e.color_key = e.batch = e.td = e.td_k = None
+    e.version = 0
     return e
 
 
-def _td3d_entry(obj, depsgraph, edit):
-    """(entry, stale) for one object; heavy rebuilds wait until edits pause."""
+def _td3d_entry(obj, depsgraph, edit, may_build=True):
+    """(entry, stale, built, deferred) for one object. Heavy rebuilds wait until edits pause;
+    `may_build` False (frame budget used up) defers a needed build to the next frame."""
     key = obj.as_pointer()
     mptr = obj.data.as_pointer()
     if edit:
         gen = ('E', mptr, _State.data_gen)
     else:
-        gen = ('O', mptr, obj.name_full, _State.id_gen.get(key, 0), _State.id_gen.get(mptr, 0))
+        gen = ('O', mptr, obj.name_full, _State.id_gen.get(key, 0), _State.id_gen.get(mptr, 0),
+               tuple(_material_keys(obj)))  # a renamed material sends no depsgraph update
     e = _State.td3d.get(key)
     if e is not None and e.gen == gen:
-        return e, False
+        return e, False, False, False
     if e is not None and e.build_ms > LIVE_MS:
         wait = DEBOUNCE_S - (time.perf_counter() - _State.last_change)
         if wait > 0.0:
             _schedule_redraw(wait + 0.01)
-            return e, True
+            return e, True, False, False
+    if not may_build:
+        return e, e is not None, False, True
     t0 = time.perf_counter()
     e = _td3d_build(obj, depsgraph, edit)
     if e is None:
         _State.td3d.pop(key, None)
-        return None, False
+        return None, False, True, False
     e.gen = gen
     e.build_ms = (time.perf_counter() - t0) * 1000.0
     e.last_used = time.perf_counter()
     _State.td3d[key] = e
-    return e, False
+    return e, False, True, False
 
 
-def _td3d_batch(e, M3, W, H, scale, thr, alpha):
-    """Per-face colors of an object; rebuilt when its scale or the settings change."""
-    ckey = (tuple(np.round(M3, 12).ravel().tolist()), W, H, scale, thr, round(alpha, 4))
-    if e.color_key != ckey:
+def _td3d_update(e, M3):
+    """Per-shell density base (_td_base) for the object's current stretch: only its scale and
+    shear matter (M^T M), so moving or rotating the object recomputes nothing."""
+    G = M3.T @ M3
+    s = float(np.abs(G).max())
+    # to 1e-5: object matrices are single precision, a rotation alone changes G by ~1e-7
+    stretch = (np.rint(G * (1e5 / s)).astype(np.int64).tobytes(), float("%.5g" % s)) if s > 0.0 else None
+    if e.stretch != stretch or e.base is None:
         world = np.linalg.norm(e.face_nvec @ _cofactor(M3).T, axis=1)
-        e.td = _td_values(e.uv_area, np.bincount(e.face_shell, weights=world, minlength=e.nshell),
-                          W, H, scale)
-        _name, sh = _builtin('fill')
+        e.base = _td_base(e.uv_area, np.bincount(e.face_shell, weights=world, minlength=e.nshell))
+        e.stretch = stretch
+        e.version += 1
+        e.batch = e.color_key = e.td = None
+
+
+def _td3d_values(e, k):
+    """Texel density in px/m per shell (NaN: no 3D area)."""
+    if e.td is None or e.td_k != k:
+        e.td = np.where(e.base >= 0.0, e.base * k, np.nan)
+        e.td_k = k
+    return e.td
+
+
+def _td3d_batch(e, sh, shader_td, W, H, scale, thr, alpha):
+    """The object's batch: densities for the texel density shader (built once per geometry /
+    stretch), or per-vertex colors (rebuilt when the settings change)."""
+    if shader_td:
+        if e.batch is None or e.color_key != 'shader':
+            e.batch = None
+            if e.tri_shell.size:
+                e.batch = _batch_attrs(sh, 'TRIS', {"pos": e.tri_co, "tdens": np.repeat(e.base[e.tri_shell], 3)})
+            e.color_key = 'shader'
+        return e.batch
+    ckey = (e.version, W, H, scale, thr, round(alpha, 4))
+    if e.color_key != ckey:
+        td = _td3d_values(e, _td_factor(W, H, scale))
         e.batch = None
         if sh is not None and e.tri_shell.size:
             col = np.empty((e.tri_shell.size * 3, 4), dtype=np.float32)
-            col[:, :3] = np.repeat(_td_rgb(e.td, *thr)[e.tri_shell], 3, axis=0)
+            col[:, :3] = np.repeat(_td_rgb(td, *thr)[e.tri_shell], 3, axis=0)
             col[:, 3] = alpha
             e.batch = _batch(sh, 'TRIS', e.tri_co, col)
         e.color_key = ckey
@@ -2508,6 +3291,29 @@ def _td3d_objects(context, space):
     return objs, False
 
 
+def _publish_3d(scene, st, drawn, k):
+    """Publish the 3D view's shells (Object Mode) for the panels and Low / High auto-fill."""
+    key = ('OBJECT', tuple((e.gen, e.version) for _o, e in drawn), k)
+    pub = _State.pub
+    if pub is None or pub.key != key:
+        ids, total, tds, mats = {}, [], [], []
+        for _obj, e in drawn:
+            lut = []
+            for mk in e.mat_keys:
+                if mk not in ids:
+                    ids[mk] = len(total)
+                    total.append(0)
+                lut.append(ids[mk])
+            lut = np.asarray(lut, dtype=np.int64)
+            for i, c in zip(lut.tolist(), e.mat_faces.tolist()):
+                total[i] += c
+            tds.append(_td3d_values(e, k))
+            mats.append(lut[e.shell_mat])
+        pub = _State.pub = _published(key, 'OBJECT', tuple(sorted(o.name_full for o, _e in drawn)),
+                                      np.concatenate(tds), k, np.concatenate(mats), list(ids), total, total)
+    _after_publish(scene, st, pub)
+
+
 def _draw3d_main(context):
     scene = getattr(context, "scene", None)
     st = getattr(scene, "uv_gap_overlay", None) if scene is not None else None
@@ -2524,14 +3330,21 @@ def _draw3d_main(context):
         _State.td_3d_stats = None
         return
     depsgraph = None if edit else context.evaluated_depsgraph_get()
-    drawn, stale = [], False
+    drawn, stale, deferred = [], False, False
     now = time.perf_counter()
+    budget_end = now + TD3D_BUDGET_MS / 1000.0
+    built_any = False
     for obj in objects:
-        e, s = _td3d_entry(obj, depsgraph, edit)
+        may_build = not built_any or time.perf_counter() < budget_end  # always make progress
+        e, s, built, d = _td3d_entry(obj, depsgraph, edit, may_build)
+        built_any |= built
+        deferred |= d
         if e is not None:
             e.last_used = now
             drawn.append((obj, e))
             stale |= s
+    if deferred:  # the rest next frame, so a big selection doesn't freeze the viewport
+        _schedule_redraw(0.0)
     for k in [k for k, e in _State.td3d.items() if now - e.last_used > 5.0]:
         del _State.td3d[k]  # objects no longer shown anywhere
     if not drawn:
@@ -2540,14 +3353,32 @@ def _draw3d_main(context):
     W, H, _src = _resolve_resolution_3d(st)
     scale = _unit_scale(scene)
     thr = _td_thresholds(st)
+    k = _td_factor(W, H, scale)
     alpha = max(0.0, min(1.0, float(st.td_fill_opacity))) * (0.35 if stale else 1.0)
-    batches = [(obj.matrix_world.copy(), _td3d_batch(e, np.array(obj.matrix_world.to_3x3(), dtype=np.float64),
-                                                      W, H, scale, thr, alpha)) for obj, e in drawn]
-    tds = [e.td for _obj, e in drawn if e.td is not None]
-    _State.td_3d_stats = _td_stats(np.concatenate(tds) if tds else _EMPTY_F, thr)
-    _name, sh = _builtin('fill')
-    if sh is None or alpha <= 0.0:
+    items = []
+    for obj, e in drawn:
+        M = obj.matrix_world
+        m3 = M.to_3x3()
+        if e.m3 is None or e.m3 != m3:  # cheap check first: most frames nothing moved
+            _td3d_update(e, np.array(m3, dtype=np.float64))
+            e.m3 = m3
+        items.append((M.copy(), e))
+    fkey = (tuple((e.gen, e.version) for _o, e in drawn), k, thr)
+    if _State.td3d_frame is None or _State.td3d_frame[0] != fkey:
+        tds = [_td3d_values(e, k) for _o, e in drawn]
+        _State.td3d_frame = (fkey, _td_stats(np.concatenate(tds) if tds else _EMPTY_F, thr))
+    _State.td_3d_stats = _State.td3d_frame[1]
+    if not edit:
+        _publish_3d(scene, st, drawn, k)
+    if alpha <= 0.0:
         return
+    sh = _td_shader()
+    shader_td = sh is not None
+    if not shader_td:
+        _name, sh = _builtin('fill')
+        if sh is None:
+            return
+    batches = [(M, _td3d_batch(e, sh, shader_td, W, H, scale, thr, alpha)) for M, e in items]
     try:
         prev_test, prev_mask = gpu.state.depth_test_get(), gpu.state.depth_mask_get()
     except Exception:
@@ -2561,12 +3392,17 @@ def _draw3d_main(context):
         biased[2] = P[2] - TD3D_DEPTH_BIAS * P[3]  # NDC z - bias: nearer by a constant depth step
         with gpu.matrix.push_pop_projection():
             gpu.matrix.load_projection_matrix(biased)
+            if shader_td:
+                _td_shader_setup(sh, thr, k, alpha)
+            else:
+                sh.bind()
             for M, batch in batches:
                 if batch is None:
                     continue
                 with gpu.matrix.push_pop():
                     gpu.matrix.multiply_matrix(M)
-                    sh.bind()
+                    if shader_td:
+                        _set_mvp(sh)
                     batch.draw(sh)
     finally:
         gpu.state.depth_mask_set(prev_mask)
@@ -2622,12 +3458,31 @@ def _on_undo_redo(*_args):
     # undo can replace data-blocks (and their memory addresses): drop everything read
     _State.arrays.clear()
     _State.td3d.clear()
+    _State.auto_key = None  # undo may have reverted auto-filled Low / High
     _mark_changed()
+
+
+def _migrate_settings():
+    """Files saved before 1.4 have no Auto Low / High setting: if their Low / High were set
+    by hand, turn Auto off for them so those values aren't replaced. Also a timer after
+    register (data is not accessible while add-ons register at startup)."""
+    try:
+        for scene in bpy.data.scenes:
+            st = getattr(scene, "uv_gap_overlay", None)
+            if st is None or st.settings_version >= 140 or st.is_property_set("td_auto_range"):
+                continue
+            if st.is_property_set("td_low_m") or st.is_property_set("td_high_m"):
+                st.td_auto_range = False
+                st.settings_version = 140
+    except Exception:
+        _report("could not update settings from an earlier version", traceback.format_exc())
+    return None
 
 
 @persistent
 def _on_load(*_args):
     _State.reset()
+    _migrate_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -2643,6 +3498,133 @@ class UVGAP_OT_refresh(bpy.types.Operator):
         _State.invalidate()
         _redraw_uv_editors()
         return {'FINISHED'}
+
+
+def _select_uv_faces(bm, uvl, sync, shown, picked, extend):
+    """Select the UVs of the `picked` faces (with UV Sync Selection: the mesh faces), and
+    deselect the other `shown` faces unless extending. Whole shells only: shells share no
+    UV vertex, so setting one shell's corners never touches another's."""
+    if sync:
+        if extend and _UV_SELECT_ON_LOOP and bm.uv_select_sync_valid:
+            # Blender 5.0+: add to the synced UV selection, then carry it over to the mesh
+            bm.uv_select_foreach_set_from_mesh(True, faces=picked)
+            bm.uv_select_sync_to_mesh()
+        else:
+            if not extend:
+                for f in shown:
+                    f.select_set(False)
+            for f in picked:
+                f.select_set(True)
+            bm.select_flush_mode()
+            if _UV_SELECT_ON_LOOP:
+                bm.uv_select_sync_valid = False  # the UV selection follows the new mesh selection
+    elif _UV_SELECT_ON_LOOP:
+        # Blender 5.0+: per-face setters also clear/set the face corners (flushed down)
+        if not extend:
+            for f in shown:
+                f.uv_select_set(False)
+        for f in picked:
+            f.uv_select_set(True)
+        bm.uv_select_flush_mode()
+    else:
+        on = set(picked)
+        for f in (picked if extend else shown):
+            s = f in on
+            for loop in f.loops:
+                luv = loop[uvl]
+                luv.select = s
+                luv.select_edge = s
+
+
+def _selection_keeper(bm, drop):
+    """Hiding or deselecting faces also deselects their vertices and edges, shared ones too:
+    remember what else is selected and return a function that selects it again."""
+    drop_v = {v for f in drop for v in f.verts}
+    drop_e = {e for f in drop for e in f.edges}
+    faces = [f for f in bm.faces if f.select and f not in drop]
+    verts = [v for v in bm.verts if v.select and v not in drop_v]
+    edges = [e for e in bm.edges if e.select and e not in drop_e]
+
+    def restore():
+        for elems in (faces, edges, verts):
+            for x in elems:
+                if not x.hide:
+                    x.select_set(True)
+    return restore
+
+
+def _hide_reveal(bm, uvl, sync, faces, reveal):
+    """Hide or reveal faces in the UV editor, as Blender's UV Hide / Reveal do: with UV Sync
+    Selection they are hidden in the mesh (revealed ones get selected); without it the UV
+    editor shows the selected faces, so they are deselected (selected, with their UVs).
+    Returns how many faces changed."""
+    if reveal:
+        if sync:
+            todo = [f for f in faces if f.hide]
+            for f in todo:
+                f.hide_set(False)
+            for f in todo:
+                f.select_set(True)
+            bm.select_flush_mode()
+            if _UV_SELECT_ON_LOOP and todo:
+                bm.uv_select_sync_valid = False
+        else:
+            todo = [f for f in faces if not f.hide and not f.select]
+            for f in todo:
+                f.select_set(True)
+            if todo:
+                _select_uv_faces(bm, uvl, False, (), todo, True)
+        return len(todo)
+    drop = [f for f in faces if not f.hide and (sync or f.select)]
+    if not drop:
+        return 0
+    restore = _selection_keeper(bm, set(drop))
+    for f in drop:
+        if sync:
+            f.hide_set(True)
+        else:
+            f.select_set(False)
+    restore()
+    if sync:
+        bm.select_flush_mode()
+        if _UV_SELECT_ON_LOOP:
+            bm.uv_select_sync_valid = False
+    return len(drop)
+
+
+def _fresh_arrays(obj, sync, want_3d=False):
+    """(arrays, faces shown in the UV editor) of an edit-mode object, read now (operators)."""
+    A = _read_edit_arrays(obj, want_3d)
+    if A is None:
+        return None
+    return A, (~A.f_hide if sync else (~A.f_hide & A.f_sel))
+
+
+def _material_shell_faces(obj, A, S, keys):
+    """(mesh face indices, shell of each) of the shells of `S` whose material - the one
+    covering most of the shell, as in the overlay and the list - is in `keys`."""
+    uniq, lut = _material_sets(obj)
+    fm = lut[np.clip(A.f_mat[S.fidx], 0, lut.size - 1)]
+    dom = _dominant(S.face_shell, fm, np.abs(S.area2) * 0.5, S.nshell)
+    use = np.asarray([k in keys for k in uniq], dtype=bool)[dom]
+    f = np.flatnonzero(use[S.face_shell])
+    return S.fidx[f], S.face_shell[f]
+
+
+def _target_keys(st, index):
+    """Material sets an operator acts on: the given row, else the checked sets, else the active row."""
+    items = st.materials
+    if 0 <= index < len(items):
+        return {items[index].key}
+    keys = {it.key for it in items if it.checked}
+    if not keys and 0 <= st.material_index < len(items):
+        keys = {items[st.material_index].key}
+    return keys
+
+
+def _set_names(keys):
+    names = sorted(_material_label(k) for k in keys)
+    return names[0] if len(names) == 1 else "%d material sets" % len(names)
 
 
 class UVGAP_OT_select_flipped(bpy.types.Operator):
@@ -2675,38 +3657,235 @@ class UVGAP_OT_select_flipped(bpy.types.Operator):
             flipped = [a < 0.0 for a in area]
             count += sum(flipped)
             picked = [f for f, s in zip(isl.faces, isl.face_shell) if flipped[s]]
-            if sync:
-                if self.extend and _UV_SELECT_ON_LOOP and bm.uv_select_sync_valid:
-                    # Blender 5.0+: add to the synced UV selection, then carry it over to the mesh
-                    bm.uv_select_foreach_set_from_mesh(True, faces=picked)
-                    bm.uv_select_sync_to_mesh()
-                else:
-                    if not self.extend:
-                        for f in isl.faces:
-                            f.select_set(False)
-                    for f in picked:
-                        f.select_set(True)
-                    bm.select_flush_mode()
-                    if _UV_SELECT_ON_LOOP:
-                        bm.uv_select_sync_valid = False  # the UV selection follows the new mesh selection
-            elif _UV_SELECT_ON_LOOP:
-                # Blender 5.0+: per-face setters also clear/set the face corners (flushed down)
-                for f, s in zip(isl.faces, isl.face_shell):
-                    if flipped[s] or not self.extend:
-                        f.uv_select_set(flipped[s])
-                bm.uv_select_flush_mode()
-            else:
-                for f, s in zip(isl.faces, isl.face_shell):
-                    on = flipped[s]
-                    if on or not self.extend:
-                        for loop in f.loops:
-                            luv = loop[uvl]
-                            luv.select = on
-                            luv.select_edge = on
+            _select_uv_faces(bm, uvl, sync, isl.faces, picked, self.extend)
             bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
         _State.invalidate()
         _redraw_uv_editors()
         self.report({'INFO'}, "%d flipped shell%s selected" % (count, "" if count == 1 else "s"))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_material_select(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_material_select"
+    bl_label = "Select Material Shells"
+    bl_description = ("Select the UV shells of a material set (with UV Sync Selection the mesh faces): "
+                      "the row's set, or the checked sets (the active row when none is checked). "
+                      "Shift: add to the selection")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(name="Row", default=-1, options={'HIDDEN', 'SKIP_SAVE'})
+    extend: BoolProperty(
+        name="Extend", description="Add to the current selection instead of replacing it",
+        default=False, options={'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def invoke(self, context, event):
+        self.extend = self.extend or event.shift
+        return self.execute(context)
+
+    def execute(self, context):
+        st = context.scene.uv_gap_overlay
+        keys = _target_keys(st, self.index)
+        if not keys:
+            self.report({'WARNING'}, "No material set to select")
+            return {'CANCELLED'}
+        sync = bool(context.scene.tool_settings.use_uv_select_sync)
+        count = 0
+        for obj in _edit_mesh_objects(context):
+            got = _fresh_arrays(obj, sync)
+            if got is None:
+                continue
+            A, vis = got
+            fidx, fsh = _material_shell_faces(obj, A, _shells(A, vis), keys)  # the shells shown
+            count += int(np.unique(fsh).size)
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            faces = bm.faces
+            _select_uv_faces(bm, bm.loops.layers.uv.active, sync,
+                             [faces[i] for i in np.flatnonzero(vis).tolist()],
+                             [faces[i] for i in fidx.tolist()], self.extend)
+            bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+        _State.invalidate()
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        self.report({'INFO'}, "%s: %d shell%s selected" % (_set_names(keys), count, "" if count == 1 else "s"))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_material_visibility(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_material_visibility"
+    bl_label = "Hide / Reveal Material Shells"
+    bl_description = ("Hide or reveal the UV shells of a material set in the UV Editor: the row's set, or "
+                      "the checked sets (the active row when none is checked). With UV Sync Selection "
+                      "the faces are hidden in the mesh; without it they are deselected, as UV Hide does")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(name="Row", default=-1, options={'HIDDEN', 'SKIP_SAVE'})
+    action: EnumProperty(
+        name="Action",
+        items=[('HIDE', "Hide", "Hide the shells"),
+               ('REVEAL', "Reveal", "Show the shells again"),
+               ('TOGGLE', "Toggle", "Hide the shells if any is shown, else reveal them")],
+        default='TOGGLE', options={'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        st = context.scene.uv_gap_overlay
+        keys = _target_keys(st, self.index)
+        if not keys:
+            self.report({'WARNING'}, "No material set to hide or reveal")
+            return {'CANCELLED'}
+        sync = bool(context.scene.tool_settings.use_uv_select_sync)
+        todo = []
+        for obj in _edit_mesh_objects(context):
+            got = _fresh_arrays(obj, sync)
+            if got is None:
+                continue
+            A, vis = got
+            shown, _fsh = _material_shell_faces(obj, A, _shells(A, vis), keys)
+            todo.append((obj, A, shown))
+        action = self.action
+        if action == 'TOGGLE':
+            action = 'HIDE' if any(shown.size for _o, _a, shown in todo) else 'REVEAL'
+        changed = 0
+        for obj, A, shown in todo:
+            if action == 'REVEAL':  # whole shells, hidden faces included, decide the material
+                fidx, _fsh = _material_shell_faces(obj, A, _shells(A, np.ones(A.f_total.size, dtype=bool)), keys)
+            else:
+                fidx = shown
+            if not fidx.size:
+                continue
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            faces = bm.faces
+            changed += _hide_reveal(bm, bm.loops.layers.uv.active, sync, [faces[i] for i in fidx.tolist()],
+                                    action == 'REVEAL')
+            bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+        _State.invalidate()
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        self.report({'INFO'}, "%s: %d face%s %s" % (_set_names(keys), changed, "" if changed == 1 else "s",
+                                                     "revealed" if action == 'REVEAL' else "hidden"))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_material_check(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_material_check"
+    bl_label = "Check Material Sets"
+    bl_description = "Check all, none or the opposite material sets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: EnumProperty(
+        name="Action",
+        items=[('ALL', "All", "Check every set"), ('NONE', "None", "Uncheck every set"),
+               ('INVERT', "Invert", "Swap checked and unchecked")],
+        default='ALL')
+
+    def execute(self, context):
+        for it in context.scene.uv_gap_overlay.materials:
+            it.checked = True if self.action == 'ALL' else False if self.action == 'NONE' else not it.checked
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_td_fill(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_td_fill"
+    bl_label = "Fill Low / High"
+    bl_description = ("Set Low and High to the lowest and highest texel density of the checked "
+                      "material sets (all shells when none is checked)")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        st = context.scene.uv_gap_overlay
+        pub = _panel_pub(context)
+        checked = _checked_keys(st)
+        rng = None
+        if pub is not None:
+            fkey, kc = _auto_key(context.scene, st, pub, checked)
+            rng = _auto_range(pub, checked, kc)
+        if rng is None:
+            self.report({'WARNING'}, "No texel density to fill from (enter Edit Mode, or show texel density "
+                                     "in the 3D Viewport for selected objects)")
+            return {'CANCELLED'}
+        st.td_low_m, st.td_high_m = rng
+        st.settings_version = max(st.settings_version, 140)
+        _State.auto_key = fkey
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_select_td_range(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_select_td_range"
+    bl_label = "Select Shells in Range"
+    bl_description = ("Select the shown UV shells whose texel density is inside the From / To range "
+                      "(with UV Sync Selection the mesh faces). Shift: add to the selection")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    extend: BoolProperty(
+        name="Extend", description="Add to the current selection instead of replacing it",
+        default=False, options={'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def invoke(self, context, event):
+        self.extend = self.extend or event.shift
+        return self.execute(context)
+
+    def execute(self, context):
+        scene = context.scene
+        st = scene.uv_gap_overlay
+        sync = bool(scene.tool_settings.use_uv_select_sync)
+        space = context.space_data
+        if space is not None and space.type == 'IMAGE_EDITOR':
+            W, H, _src = _resolve_resolution(st, space)
+        else:
+            W, H, _src = _resolve_resolution_3d(st)
+        scale = _unit_scale(scene)
+        per = []
+        for obj in _edit_mesh_objects(context):
+            got = _fresh_arrays(obj, sync, want_3d=True)
+            if got is None:
+                continue
+            A, vis = got
+            S = _shells(A, vis)
+            if not S.fidx.size:
+                continue
+            uv = np.bincount(S.face_shell, weights=np.abs(S.area2) * 0.5, minlength=S.nshell)
+            M3 = np.array(obj.matrix_world.to_3x3(), dtype=np.float64)
+            world = np.linalg.norm(_face_area_vectors(S, A) @ _cofactor(M3).T, axis=1)
+            td = _td_values(uv, np.bincount(S.face_shell, weights=world, minlength=S.nshell), W, H, scale)
+            per.append((obj, S, vis, td))
+        bounds = _td_range_bounds(np.concatenate([p[3] for p in per]), st.td_sel_from / 100.0,
+                                  st.td_sel_to / 100.0) if per else None
+        if bounds is None:
+            self.report({'WARNING'}, "No shells with a texel density")
+            return {'CANCELLED'}
+        count = 0
+        for obj, S, vis, td in per:
+            with np.errstate(invalid='ignore'):
+                inside = (td >= bounds[0]) & (td <= bounds[1])
+            count += int(np.count_nonzero(inside))
+            me = obj.data
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table()
+            faces = bm.faces
+            _select_uv_faces(bm, bm.loops.layers.uv.active, sync,
+                             [faces[i] for i in np.flatnonzero(vis).tolist()],
+                             [faces[i] for i in S.fidx[inside[S.face_shell]].tolist()], self.extend)
+            bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+        _State.invalidate()
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        f, u = _TD_FACTOR.get(st.td_unit, 1.0), _TD_LABEL.get(st.td_unit, "px/m")
+        self.report({'INFO'}, "%d shell%s from %s to %s selected" % (
+            count, "" if count == 1 else "s", _fmt_td(max(bounds[0], 0.0) * f, u), _fmt_td(bounds[1] * f, u)))
         return {'FINISHED'}
 
 
@@ -2735,6 +3914,11 @@ def _draw_td_settings(col, st):
     sub.prop(st, "td_low", text="Low (Red)")
     sub.prop(st, "td_needed", text="Needed (Green)")
     sub.prop(st, "td_high", text="High (Blue)")
+    n_checked = sum(1 for it in st.materials if it.checked)
+    row = col.row(align=True, heading="Auto Low / High")
+    row.prop(st, "td_auto_range", text=("%d Checked Material%s" % (n_checked, "" if n_checked == 1 else "s"))
+             if n_checked else "All Shells")
+    row.operator(UVGAP_OT_td_fill.bl_idname, text="", icon='FILE_REFRESH')
     col.prop(st, "td_fill_opacity", slider=True)
 
 
@@ -2752,6 +3936,80 @@ def _draw_td_summary(layout, st, stats, empty_text):
     col.label(text="Lowest %s, highest %s" % (_fmt_td(lo * f, u), _fmt_td(hi * f, u)))
     col.label(text="At or below Low: %d, at or above High: %d" % (n_low, n_high),
               icon='ERROR' if (n_low or n_high) else 'CHECKMARK')
+
+
+def _fmt_short(v):
+    return ("%.0f" % v) if v >= 99.95 else ("%.1f" % v) if v >= 9.995 else ("%.2f" % v)
+
+
+class UVGAP_UL_materials(bpy.types.UIList):
+    """Material sets: checkbox, name, shells shown and their texel density range, select, hide."""
+    bl_idname = "UVGAP_UL_materials"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index=0, flt_flag=0):
+        pub = _State.pub
+        if pub is not None and pub.mode != ('EDIT' if context.mode == 'EDIT_MESH' else 'OBJECT'):
+            pub = None
+        stats = pub.stats.get(item.key) if pub is not None else None
+        row = layout.row(align=True)
+        row.prop(item, "checked", text="")
+        mat = bpy.data.materials.get(item.key) if item.key else None
+        icon_value = 0
+        if mat is not None:
+            try:
+                icon_value = layout.icon(mat)
+            except Exception:
+                icon_value = 0
+        name = row.row()
+        if icon_value:
+            name.label(text=item.name, icon_value=icon_value)
+        else:
+            name.label(text=item.name, icon='MATERIAL' if item.key else 'CANCEL')
+        if stats is not None:
+            n, lo, hi, _faces, _faces_shown = stats
+            shown = n  # shells of this material shown: what the eye toggle hides
+            f = _TD_FACTOR.get(data.td_unit, 1.0)
+            txt = "%d" % n
+            if lo is not None:
+                txt += "  " + (_fmt_short(lo * f) if abs(hi - lo) <= 1e-9 * max(hi, 1.0)
+                               else "%s-%s" % (_fmt_short(lo * f), _fmt_short(hi * f)))
+            info = row.row()
+            info.alignment = 'RIGHT'
+            info.label(text=txt)
+        else:
+            shown = 1
+        op = row.operator(UVGAP_OT_material_select.bl_idname, text="", icon='RESTRICT_SELECT_OFF', emboss=False)
+        op.index = index
+        op = row.operator(UVGAP_OT_material_visibility.bl_idname, text="",
+                          icon='HIDE_OFF' if shown else 'HIDE_ON', emboss=False)
+        op.index = index
+        op.action = 'TOGGLE'
+
+
+def _draw_materials(layout, context):
+    st = context.scene.uv_gap_overlay
+    _panel_pub(context)
+    if not st.materials:
+        layout.label(text="Enter Edit Mode on a mesh" if context.mode != 'EDIT_MESH' else "No faces",
+                     icon='INFO')
+        return
+    layout.template_list("UVGAP_UL_materials", "", st, "materials", st, "material_index",
+                         rows=3 if len(st.materials) < 4 else 5)
+    n_checked = sum(1 for it in st.materials if it.checked)
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.operator(UVGAP_OT_material_select.bl_idname, text="Select", icon='RESTRICT_SELECT_OFF')
+    op = row.operator(UVGAP_OT_material_visibility.bl_idname, text="Hide", icon='HIDE_ON')
+    op.action = 'HIDE'
+    op = row.operator(UVGAP_OT_material_visibility.bl_idname, text="Reveal", icon='HIDE_OFF')
+    op.action = 'REVEAL'
+    row = col.row(align=True)
+    row.operator(UVGAP_OT_material_check.bl_idname, text="All", icon='CHECKBOX_HLT').action = 'ALL'
+    row.operator(UVGAP_OT_material_check.bl_idname, text="None", icon='CHECKBOX_DEHLT').action = 'NONE'
+    row.operator(UVGAP_OT_material_check.bl_idname, text="Invert", icon='ARROW_LEFTRIGHT').action = 'INVERT'
+    layout.label(text=("Buttons act on the %d checked set%s" % (n_checked, "" if n_checked == 1 else "s"))
+                 if n_checked else "Buttons act on the active row", icon='INFO')
+    layout.prop(st, "same_material")
 
 
 class _UVGapPanel:
@@ -2791,7 +4049,9 @@ class UVGAP_PT_main(_UVGapPanel, bpy.types.Panel):
         col.prop(st, "min_px")
         col.prop(st, "needed_px")
         col.prop(st, "search_px")
-        layout.prop(st, "selected_only")
+        col = layout.column()
+        col.prop(st, "selected_only")
+        col.prop(st, "same_material")
 
         layout.separator()
         row = layout.row(align=True, heading="Flipped Shells")
@@ -2854,7 +4114,6 @@ class UVGAP_PT_display(_UVGapPanel, bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
-        layout.active = st.show
         col = layout.column(align=True)
         col.prop(st, "font_size")
         col.prop(st, "opacity", slider=True)
@@ -2885,6 +4144,34 @@ class UVGAP_PT_colors(_UVGapPanel, bpy.types.Panel):
         col.prop(st, "color_flipped")
 
 
+class UVGAP_PT_info(_UVGapPanel, bpy.types.Panel):
+    bl_idname = "UVGAP_PT_info"
+    bl_label = "Shell Info"
+
+    @classmethod
+    def poll(cls, context):
+        return UVGAP_PT_main.poll(context)
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.uv_gap_overlay, "info_show", text="")
+
+    def draw(self, context):
+        st = context.scene.uv_gap_overlay
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.active = st.info_show
+        col = layout.column(heading="Show")
+        col.prop(st, "show_orientation", text="Orientation Arrows")
+        col.prop(st, "show_scale", text="Object Scale Not 1")
+        box = layout.box().column(align=True)
+        box.label(text="One block per shell:", icon='INFO')
+        box.label(text="texel density (Texel Density panel),")
+        box.label(text="object scale, Flipped (with UV Shell Gaps)")
+        box.label(text="Blue arrow: the scene's up (+Z) on the shell")
+        box.label(text="Green arrow: +Y, on shells lying flat")
+
+
 class UVGAP_PT_texel(_UVGapPanel, bpy.types.Panel):
     bl_idname = "UVGAP_PT_texel"
     bl_label = "Texel Density"
@@ -2901,6 +4188,7 @@ class UVGAP_PT_texel(_UVGapPanel, bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
+        _panel_pub(context)
         col = layout.column()
         col.active = st.td_show or st.td_show_3d
         _draw_resolution(col, st, context.space_data)
@@ -2912,10 +4200,60 @@ class UVGAP_PT_texel(_UVGapPanel, bpy.types.Panel):
                              "Enter Edit Mode on a mesh")
 
 
-class UVGAP_PT_texel_3d(bpy.types.Panel):
+def _draw_td_range(layout, context):
+    st = context.scene.uv_gap_overlay
+    pub = _panel_pub(context)
+    f, u = _TD_FACTOR.get(st.td_unit, 1.0), _TD_LABEL.get(st.td_unit, "px/m")
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(st, "td_sel_from", text="", slider=True)
+    row.prop(st, "td_sel_to", text="", slider=True)
+    if pub is None or pub.tmin is None:
+        layout.label(text="Enter Edit Mode on a mesh" if context.mode != 'EDIT_MESH' else "No shells with a 3D area",
+                     icon='INFO')
+    else:
+        lo, hi = _td_range_bounds(pub.td, st.td_sel_from / 100.0, st.td_sel_to / 100.0)
+        row = col.row(align=True)
+        row.alignment = 'EXPAND'
+        row.label(text=_fmt_td(max(lo, 0.0) * f, u))
+        row.label(text=_fmt_td(hi * f, u))
+        with np.errstate(invalid='ignore'):
+            n_in = int(np.count_nonzero((pub.td >= lo) & (pub.td <= hi)))
+        box = layout.box().column(align=True)
+        box.label(text="Shells: %s to %s" % (_fmt_td(pub.tmin * f, u), _fmt_td(pub.tmax * f, u)))
+        box.label(text="In range: %d of %d" % (n_in, pub.td.size))
+    layout.prop(st, "td_range_highlight")
+    layout.operator(UVGAP_OT_select_td_range.bl_idname, icon='RESTRICT_SELECT_OFF')
+
+
+class UVGAP_PT_texel_range(_UVGapPanel, bpy.types.Panel):
+    bl_idname = "UVGAP_PT_texel_range"
+    bl_label = "Select by Range"
+    bl_parent_id = "UVGAP_PT_texel"
+
+    def draw(self, context):
+        _draw_td_range(self.layout, context)
+
+
+class UVGAP_PT_materials(_UVGapPanel, bpy.types.Panel):
+    bl_idname = "UVGAP_PT_materials"
+    bl_label = "Materials"
+
+    @classmethod
+    def poll(cls, context):
+        return UVGAP_PT_main.poll(context)
+
+    def draw(self, context):
+        _draw_materials(self.layout, context)
+
+
+class _UVGap3DPanel:
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "UV Gaps"
+
+
+class UVGAP_PT_texel_3d(_UVGap3DPanel, bpy.types.Panel):
     bl_idname = "UVGAP_PT_texel_3d"
     bl_label = "Texel Density"
 
@@ -2927,6 +4265,7 @@ class UVGAP_PT_texel_3d(bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
+        _panel_pub(context)
         col = layout.column()
         col.active = st.td_show_3d or st.td_show
         _draw_resolution(col, st, None, in_3d=True)
@@ -2941,20 +4280,40 @@ class UVGAP_PT_texel_3d(bpy.types.Panel):
                          icon='EDITMODE_HLT' if edit else 'OBJECT_DATAMODE')
 
 
+class UVGAP_PT_materials_3d(_UVGap3DPanel, bpy.types.Panel):
+    bl_idname = "UVGAP_PT_materials_3d"
+    bl_label = "Materials"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _draw_materials(self.layout, context)
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 _classes = (
+    UVGAP_MaterialItem,
     UVGAP_Settings,
     UVGAP_OT_refresh,
     UVGAP_OT_select_flipped,
+    UVGAP_OT_material_select,
+    UVGAP_OT_material_visibility,
+    UVGAP_OT_material_check,
+    UVGAP_OT_td_fill,
+    UVGAP_OT_select_td_range,
+    UVGAP_UL_materials,
     UVGAP_PT_main,
     UVGAP_PT_tiles,
     UVGAP_PT_display,
     UVGAP_PT_colors,
+    UVGAP_PT_materials,
     UVGAP_PT_texel,
+    UVGAP_PT_texel_range,
+    UVGAP_PT_info,
     UVGAP_PT_texel_3d,
+    UVGAP_PT_materials_3d,
 )
 
 _handler_lists = (
@@ -2971,6 +4330,7 @@ def register():
     bpy.types.Scene.uv_gap_overlay = PointerProperty(type=UVGAP_Settings)
     _State.reset()
     _State.shader_names = {}
+    _State.td_shader = None
     _State.numpy_buffers = True
     _State.draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
         _draw_callback, (), 'WINDOW', 'POST_PIXEL')
@@ -2982,6 +4342,8 @@ def register():
             handlers.append(fn)
     if not bpy.app.timers.is_registered(_create_scratch_mesh):
         bpy.app.timers.register(_create_scratch_mesh, first_interval=0.0)
+    if not bpy.app.timers.is_registered(_migrate_settings):
+        bpy.app.timers.register(_migrate_settings, first_interval=0.0)
 
 
 def unregister():
@@ -2995,13 +4357,14 @@ def unregister():
         handlers = getattr(bpy.app.handlers, name)
         if fn in handlers:
             handlers.remove(fn)
-    for timer in (_redraw_timer, _create_scratch_mesh):
+    for timer in (_redraw_timer, _create_scratch_mesh, _apply_pending, _migrate_settings):
         if bpy.app.timers.is_registered(timer):
             bpy.app.timers.unregister(timer)
     del bpy.types.Scene.uv_gap_overlay
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     _State.reset()
+    _State.td_shader = None
     try:  # the scratch mesh has no users and is never saved; remove it right away anyway
         me = bpy.data.meshes.get(_SCRATCH_MESH)
         if me is not None and not me.users:
