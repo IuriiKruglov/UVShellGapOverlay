@@ -1,3 +1,7 @@
+| | |
+| :---: | :---: |
+| [![UVShell_Gap_3](https://github.com/user-attachments/assets/0dade392-4dce-4471-9a60-366ac326ee1c)](https://github.com/user-attachments/assets/0dade392-4dce-4471-9a60-366ac326ee1c) | [![UVShell_Gap_2](https://github.com/user-attachments/assets/508549e1-e3ac-4bdd-aceb-4392e8eaac06)](https://github.com/user-attachments/assets/508549e1-e3ac-4bdd-aceb-4392e8eaac06) |
+
 # UV Shell Gap Overlay
 
 A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells. Shells stacked on each other on purpose, such as copies of a part sharing texture space, are told apart from real overlaps: a stack counts as one shell, and its copies can be selected or moved to another UDIM tile with one click.
@@ -479,29 +483,6 @@ What a shader could still add: while you pan or zoom, the screen positions of al
 - In Edit Mode the 3D Viewport colors the edit cage. With modifiers shown in Edit Mode, such as Subdivision Surface or Mirror, the colors follow the cage, not the modifier result.
 - Info blocks appear in the UV Editor only; the 3D Viewport shows the colors.
 - Only the active UV map of each mesh is measured.
-
----
-
-## Troubleshooting
-
-- **Nothing is drawn.** Check that:
-  - you are in Edit Mode;
-  - the editor is a UV Editor, not the Image Editor in View mode;
-  - the panel's header checkbox is on;
-  - the UV Editor's *Overlays* are enabled.
-
-  With UV Sync Selection off, only faces selected in the mesh are shown, and only those are measured.
-- **No colors in the 3D Viewport.** Check the header checkbox of the Texel Density panel in the 3D Viewport sidebar, and the viewport's *Overlays*. In Object Mode, the objects must be selected and have a UV map.
-- **Numbers look too small or too large.** Check *Texture*: distances and densities scale with the resolution. For texel density also check the scene's *Unit Scale* (*Scene Properties → Units*).
-- **Low and High keep changing.** *Auto Low / High* is on and the checked material sets, the shown objects, *Texture* or *Unit Scale* changed. Type a value, or untick *Auto Low / High*, to keep your own values.
-- **A material is missing from the list.** The list shows materials used by faces of the shown objects: in Edit Mode, the objects being edited. It updates on the next redraw after a change.
-- **Copies I stacked are reported as overlaps.** They cover each other by less than *Stack Match*. Lower it (99 %, say), or select them with *Select: Overlapping* and snap them onto each other.
-- **Stacked copies are no longer flagged as overlaps.** That is *Stacked Shells as One* in the Overlaps and Stacks subpanel. Turn it off to see every copy as an overlap again.
-- **Move All but One says there is nothing to move.** With *Only in the 0-1 Tile* on, it takes shells of the 0–1 tile only, and none of them lies on another: the copies are in another tile already. Turn the option off to treat every tile.
-- **Overlaps are still counted after Move All but One.** The moved copies lie on each other in the tile they went to. The line `0 of them in the 0-1 tile` in the summary says the 0–1 tile is clean.
-- **A mesh named `.UV Gap Overlay scratch` appears under *Blender File* in the Outliner.** The add-on uses this empty helper mesh to read edit-mode meshes quickly. It has no users, is never saved with your file, and is removed when the add-on is turned off.
-- **The add-on appears twice in the Add-ons list.** Both the `.py` and the `.zip` are installed. Uninstall one of them and restart Blender.
-- **Something went wrong.** The add-on prints each error once to the system console. On Windows use *Window → Toggle System Console*; on other systems start Blender from a terminal. If your graphics driver can't compile the add-on's texel density shader, the console says so. The colors then come from a slower built-in path that looks the same.
 
 ---
 
