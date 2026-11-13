@@ -34,7 +34,7 @@ A Blender add-on that shows, directly on your UV layout, how many texture pixels
 
 ## Installation
 
-The add-on comes in two forms with the same code inside. Install only one of them. Download it from the [latest release](https://github.com/IuriiKruglov/UVShellGapOverlay/releases/latest), under *Assets*. The *Source code* archives there are the repository itself, not an add-on Blender can install.
+The add-on comes in two forms with the same code inside. Install only one of them. Download it from the [latest release](https://github.com/IuriiKruglov/UVShellGapOverlay/releases/latest), under *Assets*. The *Source code* archives there are the repository itself, not an add-on Blender can install. Also you can get it free on [gumroad](https://tricky3d.gumroad.com/l/UVShellGapOverlay)
 
 | File | Blender | Installs as |
 |---|---|---|
