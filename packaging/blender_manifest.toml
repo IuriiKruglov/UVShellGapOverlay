@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "uv_shell_gap_overlay"
+version = "1.5.0"
+name = "UV Shell Gap Overlay"
+tagline = "Pixel gaps, overlaps, texel density and info for UV shells"
+maintainer = "Iurii Kruglov"
+type = "add-on"
+website = "https://github.com/IuriiKruglov/UVShellGapOverlay"
+
+tags = ["UV"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 Iurii Kruglov",
+]

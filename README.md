@@ -6,7 +6,7 @@
 
 A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells. Shells stacked on each other on purpose, such as copies of a part sharing texture space, are told apart from real overlaps: a stack counts as one shell, and its copies can be selected or moved to another UDIM tile with one click.
 
-**Version:** 1.5.0 · **Blender:** 3.6 LTS to 5.2 LTS · **License:** GPL-3.0-or-later
+**Version:** 1.5.0 · **Blender:** 3.6 LTS to 5.3 · **License:** GPL-3.0-or-later
 
 ---
 
@@ -34,7 +34,7 @@ A Blender add-on that shows, directly on your UV layout, how many texture pixels
 
 ## Installation
 
-The add-on comes in two forms with the same code inside. Install only one of them.
+The add-on comes in two forms with the same code inside. Install only one of them. Download it from the [latest release](https://github.com/IuriiKruglov/UVShellGapOverlay/releases/latest), under *Assets*. The *Source code* archives there are the repository itself, not an add-on Blender can install.
 
 | File | Blender | Installs as |
 |---|---|---|
@@ -50,7 +50,7 @@ You can also drag the `.zip` from your file browser into the Blender window.
 
 **Blender 3.6**
 1. Open *Edit → Preferences → Add-ons* and click **Install…**
-2. Select `uv_shell_gap_overlay.py`, then tick the checkbox next to **UV: UV Shell Gap Overlay**.
+2. Select `uv_shell_gap_overlay.py`, then tick the checkbox next to **UV: UV Shell Gap Overlay**. Keep the file's name: Blender uses it as the add-on's module name, so a renamed copy installs as a second add-on, and a name with dots in it doesn't load at all.
 
 **Updating.** Install the new file the same way.
 - The extension is replaced in place and stays enabled.
@@ -61,6 +61,7 @@ You can also drag the `.zip` from your file browser into the Blender window.
 
 | Blender | Status |
 |---|---|
+| 5.3 | Checked with 5.3.0: installing, measuring, the buttons and the drawing |
 | 5.0, 5.1, 5.2 LTS | Tested with 5.0.1, 5.1.2 and 5.2.2 |
 | 4.2 LTS, 4.5 LTS | Tested with 4.2.23 and 4.5.14 |
 | 3.6 LTS | Supported with the `.py` file. Not covered by the tests inside Blender: see below |
@@ -542,4 +543,4 @@ What a shader could still add: while you pan or zoom, the screen positions of al
 
 ## License
 
-GPL-3.0-or-later
+GPL-3.0-or-later. See [LICENSE](LICENSE).
