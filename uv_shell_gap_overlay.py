@@ -5,13 +5,15 @@
 # Draws, along the shell borders in the UV Editor, the pixel distance between
 # neighboring UV shells and from shells to their UDIM tile border, graded
 # against minimal / needed padding; marks overlapping, tile-crossing and
-# flipped (mirrored) shells. Shells stacked on each other on purpose (copies
-# sharing texture space) count as one shell; the copies can be selected and
-# moved to another UDIM tile. Colors and labels every shell by its texel
-# density, in the UV Editor and on the mesh in the 3D Viewport. One info
-# block per shell collects its texel density, object scale, flip state and
-# an arrow for the scene's up direction. Material sets: select, hide and
-# reveal the shells of chosen materials, measure gaps only within a material.
+# flipped (mirrored) shells, and shells welded onto themselves (a mirrored
+# half merged without a UV offset). Shells stacked on each other on purpose
+# (copies sharing texture space) count as one shell; the copies can be
+# selected and moved to another UDIM tile, and welded shells split the same
+# way. Colors and labels every shell by its texel density, in the UV Editor
+# and on the mesh in the 3D Viewport. One info block per shell collects its
+# texel density, object scale, flip state and an arrow for the scene's up
+# direction. Material sets: select, hide and reveal the shells of chosen
+# materials, measure gaps only within a material.
 #
 # Authors: Iurii Kruglov & Claude (Anthropic)
 # Home:    https://github.com/IuriiKruglov/UVShellGapOverlay
@@ -19,12 +21,12 @@
 bl_info = {
     "name": "UV Shell Gap Overlay",
     "author": "Iurii Kruglov, Claude (Anthropic)",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (3, 6, 0),
     "location": "UV Editor / 3D Viewport > Sidebar (N) > UV Gaps",
     "description": "Pixel gaps between UV shells and to UDIM tile borders, texel density per shell "
                    "(UV Editor and 3D Viewport), per-shell info blocks, material sets; overlap, stack, "
-                   "tile-crossing and flipped-shell checks",
+                   "welded-overlap, tile-crossing and flipped-shell checks",
     "doc_url": "https://github.com/IuriiKruglov/UVShellGapOverlay",
     "tracker_url": "https://github.com/IuriiKruglov/UVShellGapOverlay/issues",
     "category": "UV",
@@ -61,6 +63,9 @@ UV_QUANT = 1.0e6         # loops on one mesh vertex whose UVs agree to 1e-6 shar
 UV_EPS = 1.0e-6          # inset (UV units) for shell-inside-shell probes
 PX_EPS = 1.0e-3          # inset (texture px) for per-point overlap probes
 TILE_EPS = 1.0e-6        # UV tolerance: a shell touching a tile line does not cross it
+FOLD_EPS = 1.0e-6        # UV: a face reaching less than this far from an edge (on average) has no side
+AREA_REL = 1.0e-6        # relative tolerance on UV areas: flipped is a signed area below -AREA_REL x the
+                         # unsigned one (halves that cancel out aren't); parts this close are as big
 EDGE_FACING = 0.25       # a border point measures only toward what its outward normal faces:
                          # at most ~75 deg off the normal (cos >= 0.25), for tile edges and neighbors
 CROSS_TOL = 1.0e-7       # parametric tolerance: meeting at segment ends is touching, not crossing
@@ -138,6 +143,7 @@ class _State:
     stacks = None        # stacks of the geometry (_Stacks) when no measurement provides them
     stacks_key = None
     home = None          # (what for, counts): see _home_counts
+    lost = None          # (what for, (lost, outside)): see _lost_of
     td3d = {}            # object -> _TD3D (3D view texel density)
     td_values = {}       # texel density per shell, per (geometry, texture, unit scale)
     td_fill = {}         # UV editor texel density fill batches
@@ -174,7 +180,7 @@ class _State:
         cls.td_fill.clear()
         cls.frame.clear()
         cls.td3d_frame = None
-        cls.stacks = cls.stacks_key = cls.home = None
+        cls.stacks = cls.stacks_key = cls.home = cls.lost = None
         if hard:
             cls.parts.clear()
             if cls.mcache is not None:
@@ -426,6 +432,38 @@ class UVGAP_Settings(bpy.types.PropertyGroup):
         description="Highlight shells whose UVs are mirrored (clockwise winding in UV space)",
         default=True, update=_on_setting_changed)
 
+    # gap lines: off, the other marks of the overlay stay
+    show_gaps: BoolProperty(
+        name="Show Gaps",
+        description="Draw the distance lines and their pixel labels, between shells and to the tile border. Off: "
+                    "the other marks of this overlay stay - overlaps, tile crossings, flipped shells, welded "
+                    "overlaps, shells with no main in the 0-1 tile, shells under 1 px",
+        default=True, update=_on_setting_changed)
+
+    # welded overlaps
+    show_welded: BoolProperty(
+        name="Show Welded Overlaps",
+        description="Mark in red the UV edges where a shell is welded onto itself: two faces share the edge in "
+                    "UV but lie on the same side of it, so the shell folds over and overlaps itself. A Mirror "
+                    "modifier with Merge leaves this when it is applied without a UV offset",
+        default=True, update=_on_setting_changed)
+
+    # shells outside the 0-1 tile with nothing there to take their texture from
+    show_lost: BoolProperty(
+        name="Show Shells with No Main in 0-1",
+        description="Mark shells lying outside the 0-1 tile (UDIM 1001) that have no main there: moved back by "
+                    "whole tiles, they lie on no shell of the 0-1 tile (by Stack Match; mirrored copies count). "
+                    "Copies moved away from a main that stays are fine. A part moved out entirely, with all its "
+                    "copies, gets nothing from a bake of the 0-1 tile",
+        default=True, update=_on_setting_changed)
+
+    # shells smaller than a texel
+    show_tiny: BoolProperty(
+        name="Show Shells Under 1 px",
+        description="Mark shells less than one texture pixel wide or tall: their extent along U times the "
+                    "texture width, or along V times its height, is under 1 (at the Texture resolution)",
+        default=True, update=_on_setting_changed)
+
     # display
     font_size: IntProperty(
         name="Font Size", default=12, min=6, max=72, subtype='PIXEL', update=_on_setting_changed)
@@ -458,6 +496,15 @@ class UVGAP_Settings(bpy.types.PropertyGroup):
     color_flipped: FloatVectorProperty(
         name="Flipped", subtype='COLOR_GAMMA', size=3, min=0.0, max=1.0,
         default=(0.2, 0.65, 1.0), update=_on_setting_changed)
+    color_welded: FloatVectorProperty(
+        name="Welded", subtype='COLOR_GAMMA', size=3, min=0.0, max=1.0,
+        default=(1.0, 0.0, 0.0), update=_on_setting_changed)
+    color_lost: FloatVectorProperty(
+        name="No Main in 0-1", subtype='COLOR_GAMMA', size=3, min=0.0, max=1.0,
+        default=(1.0, 0.55, 0.0), update=_on_setting_changed)
+    color_tiny: FloatVectorProperty(
+        name="Under 1 px", subtype='COLOR_GAMMA', size=3, min=0.0, max=1.0,
+        default=(0.0, 1.0, 1.0), update=_on_setting_changed)
 
     # texel density
     td_show: BoolProperty(
@@ -1128,9 +1175,9 @@ def _shell_selection(ls, off, face_shell, nshell):
     return np.bincount(face_shell, weights=face_sel, minlength=nshell) > 0
 
 
-def _gap_pieces(S, csel):
-    """Ordered shell borders, per-shell selection and area, fan triangles of mirrored
-    shells: the input of the gap measurement. `csel`: see _corner_selection."""
+def _edge_uses(S):
+    """UV edges: (the other end of each corner's edge, corners sorted by edge, how many faces
+    use the edge of each corner)."""
     vid, nxt, nv = S.vid, S.nxt, S.vx.size
     eb = vid[nxt]
     key = np.minimum(vid, eb) * max(nv, 1) + np.maximum(vid, eb)
@@ -1142,7 +1189,43 @@ def _gap_pieces(S, csel):
     run = np.cumsum(brk) - 1
     uses = np.empty(ks.size, dtype=np.int64)
     uses[o] = np.bincount(run)[run] if ks.size else run
-    bk = np.flatnonzero(uses == 1)  # UV edges used by a single face
+    return eb, o, uses
+
+
+def _fan_tris(S, faces):
+    """Fan triangles (UV) of the given shown faces, and the face of each."""
+    vid = S.vid
+    nt = np.maximum(S.tot[faces] - 2, 0)
+    tf = np.repeat(faces, nt)
+    k = np.arange(int(nt.sum()), dtype=np.int64) - np.repeat(np.cumsum(nt) - nt, nt) + 1
+    l0 = S.off[tf]
+    v0, v1, v2 = vid[l0], vid[l0 + k], vid[l0 + k + 1]
+    tris = np.stack((np.column_stack((S.vx[v0], S.vy[v0])), np.column_stack((S.vx[v1], S.vy[v1])),
+                     np.column_stack((S.vx[v2], S.vy[v2]))), axis=1)
+    return tris.reshape(-1, 3, 2), tf
+
+
+def _gap_pieces(S, csel):
+    """Ordered shell borders, per-shell selection and area, fan triangles of mirrored
+    shells, welded overlaps: the input of the gap measurement and of what is drawn with it.
+    A welded shell is measured as the layer it keeps (_welded): what lies folded over onto it
+    is left out, its welded edges become part of the border - the shell as splitting it
+    leaves it in place. `csel`: see _corner_selection."""
+    vid, nv = S.vid, S.vx.size
+    eb, o, uses = _edge_uses(S)
+    weld = _welded(S, eb, o, uses)
+    far = weld["far"]
+    area2 = S.area2
+    if far.size:
+        kept = np.ones(S.fidx.size, dtype=bool)
+        kept[far] = False
+        kc = np.flatnonzero(kept[S.lface])  # corners of the faces kept, and their UV edges' uses
+        key = np.minimum(vid[kc], eb[kc]) * max(nv, 1) + np.maximum(vid[kc], eb[kc])
+        _u, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+        bk = kc[cnt[inv.reshape(-1)] == 1]
+        area2 = np.where(kept, S.area2, 0.0)
+    else:
+        bk = np.flatnonzero(uses == 1)  # UV edges used by a single face
     b_face = S.lface[bk]
     fa = S.area2[b_face]
     b_sign = np.where(fa > 0.0, 1.0, np.where(fa < 0.0, -1.0, 0.0))
@@ -1150,7 +1233,9 @@ def _gap_pieces(S, csel):
 
     counts = np.bincount(ch_sh, minlength=S.nshell)
     shells_e = np.flatnonzero(counts)  # shells with a border, in shell order
-    shell_area2 = np.bincount(S.face_shell, weights=S.area2, minlength=S.nshell)
+    shell_area2 = np.bincount(S.face_shell, weights=area2, minlength=S.nshell)
+    # flipped: clearly clockwise (by the layer kept: a welded mirrored half doesn't flip it)
+    shell_flip = shell_area2 < -AREA_REL * np.bincount(S.face_shell, weights=np.abs(area2), minlength=S.nshell)
     if csel is None:
         shell_sel = np.ones(S.nshell, dtype=bool)
     else:
@@ -1159,15 +1244,11 @@ def _gap_pieces(S, csel):
     gid_of = np.full(S.nshell, -1, dtype=np.int64)
     gid_of[shells_e] = np.arange(shells_e.size)
     fsh = S.face_shell
-    ff = np.flatnonzero((shell_area2[fsh] < 0.0) & (gid_of[fsh] >= 0))  # faces of mirrored shells
-    nt = np.maximum(S.tot[ff] - 2, 0)
-    tf = np.repeat(ff, nt)
-    k = np.arange(int(nt.sum()), dtype=np.int64) - np.repeat(np.cumsum(nt) - nt, nt) + 1
-    l0 = S.off[tf]
-    v0, v1, v2 = vid[l0], vid[l0 + k], vid[l0 + k + 1]
-    tris = np.stack((np.column_stack((S.vx[v0], S.vy[v0])), np.column_stack((S.vx[v1], S.vy[v1])),
-                     np.column_stack((S.vx[v2], S.vy[v2]))), axis=1)
-    return {
+    mirrored = shell_flip[fsh] & (gid_of[fsh] >= 0)  # faces of mirrored shells
+    if far.size:
+        mirrored[far] = False
+    tris, tf = _fan_tris(S, np.flatnonzero(mirrored))
+    out = {
         "shells": shells_e,
         "seg_a": np.column_stack((S.vx[ch_a], S.vy[ch_a])),
         "seg_b": np.column_stack((S.vx[ch_b], S.vy[ch_b])),
@@ -1175,9 +1256,133 @@ def _gap_pieces(S, csel):
         "count": counts[shells_e],
         "sel": shell_sel[shells_e],
         "area2": shell_area2[shells_e],
-        "tris": tris.reshape(-1, 3, 2),
+        "flip": shell_flip[shells_e],
+        "tris": tris,
         "tri_gid": gid_of[fsh[tf]],
     }
+    out.update(weld)
+    return out
+
+
+_NO_FOLDS = {"fold_a": _EMPTY2, "fold_b": _EMPTY2, "fold_shell": _EMPTY_I, "far": _EMPTY_I, "far_level": _EMPTY_I,
+             "fold_tris": np.empty((0, 3, 2)), "fold_tri_shell": _EMPTY_I}  # (shared: never written to)
+
+
+def _welded(S, eb, o, uses):
+    """Welded overlaps: UV edges two faces share - welded in UV, so of one shell - while both
+    faces lie on the same side of the edge. The shell folds over onto itself there, the way
+    a Mirror modifier with Merge leaves a mirrored half when it is applied without a UV
+    offset: the halves lie on each other exactly, and nothing that compares shells sees it.
+    A face lies left of an edge it runs along forward when it winds counterclockwise in UV
+    (area2 > 0), right of it when clockwise; the faces' 3D winding doesn't matter. A face
+    that hardly reaches away from the edge (FOLD_EPS: zero UV area, rounding) has no side.
+
+    What lies folded over: cut along its welded edges, a shell falls into parts - faces
+    joined by the UV edges that don't fold. Of parts joined by folds, one is the shell's own
+    layer: the biggest by UV area, an unflipped one among parts as big (a mirrored half and
+    its original); the others lie folded over onto it (moving those splits the shell).
+    `o`: corners sorted by UV edge, `uses`: faces per UV edge, per corner (_edge_uses).
+    Returns {"fold_a", "fold_b": UV of the ends of each welded edge, "fold_shell": its shell
+    (edges ordered by shell), "far": the shown faces lying folded over (ascending),
+    "far_level": how far each moves when the shells are split (_split_levels), "fold_tris",
+    "fold_tri_face": their fan triangles and the face of each}."""
+    vid = S.vid
+    out = dict(_NO_FOLDS, fold_tri_face=_EMPTY_I)
+    pair = o[uses[o] == 2].reshape(-1, 2)  # UV edges of two faces: their corners, side by side
+    if not pair.size:
+        return out
+    c1, c2 = pair[:, 0], pair[:, 1]
+    f1, f2 = S.lface[c1], S.lface[c2]
+    ar1, ar2 = S.area2[f1], S.area2[f2]
+    # same side: (counterclockwise) == (walks the edge from its lower id to its higher one)
+    # comes out the same for both faces - in a mesh wound one way, faces of opposite winding
+    fold = ((ar1 > 0.0) == (vid[c1] < eb[c1])) == ((ar2 > 0.0) == (vid[c2] < eb[c2]))
+    cand = np.flatnonzero(fold)
+    if not cand.size:
+        return out
+    a, b = vid[c1[cand]], eb[c1[cand]]
+    ax, ay = S.vx[a], S.vy[a]
+    reach = np.hypot(S.vx[b] - ax, S.vy[b] - ay) * (FOLD_EPS * np.maximum(1.0, np.maximum(np.abs(ax), np.abs(ay))))
+    fold[cand[~((reach > 0.0) & (np.abs(ar1[cand]) > reach) & (np.abs(ar2[cand]) > reach))]] = False
+    if not fold.any():
+        return out
+
+    shell = S.face_shell[f1[fold]]
+    order = np.argsort(shell, kind='stable')
+    a, b = vid[c1[fold]][order], eb[c1[fold]][order]
+    out["fold_a"] = np.column_stack((S.vx[a], S.vy[a]))
+    out["fold_b"] = np.column_stack((S.vx[b], S.vy[b]))
+    out["fold_shell"] = shell[order].astype(np.int64)
+
+    # the parts of the shells that fold (local numbering of their faces)
+    welded = np.zeros(S.nshell, dtype=bool)
+    welded[shell] = True
+    wf = np.flatnonzero(welded[S.face_shell])
+    loc = np.full(S.fidx.size, -1, dtype=np.int64)
+    loc[wf] = np.arange(wf.size)
+    join = ~fold & welded[S.face_shell[f1]]
+    ja, jb = [loc[f1[join]]], [loc[f2[join]]]
+    multi = o[uses[o] > 2]  # (edges of three faces or more join them all)
+    multi = multi[welded[S.face_shell[S.lface[multi]]]]
+    if multi.size:
+        k = np.minimum(vid[multi], eb[multi]) * max(S.vx.size, 1) + np.maximum(vid[multi], eb[multi])
+        first = np.r_[True, k[1:] != k[:-1]]
+        lead = multi[np.maximum.accumulate(np.where(first, np.arange(multi.size), 0))]
+        ja.append(loc[S.lface[lead]])
+        jb.append(loc[S.lface[multi]])
+    part = _components(wf.size, np.concatenate(ja), np.concatenate(jb))
+    ar = S.area2[wf]
+    signed = np.bincount(part, weights=ar, minlength=wf.size)
+    size = np.bincount(part, weights=np.abs(ar), minlength=wf.size)
+    # parts joined by folds, and the one of them that stays
+    group = _components(wf.size, part[loc[f1[fold]]], part[loc[f2[fold]]])
+    roots = np.flatnonzero(part == np.arange(wf.size))
+    gid = group[roots]
+    big = np.zeros(wf.size)
+    np.maximum.at(big, gid, size[roots])
+    near = size[roots] >= big[gid] * (1.0 - AREA_REL)
+    unflipped = signed[roots] > AREA_REL * size[roots]
+    o2 = np.lexsort((roots, ~unflipped, ~near, gid))
+    stay = o2[np.r_[True, gid[o2][1:] != gid[o2][:-1]]]
+    kept = np.zeros(wf.size, dtype=bool)
+    kept[roots[stay]] = True
+    farm = ~kept[part]
+    far = wf[farm]
+    out["far"] = far.astype(np.int64)
+    out["far_level"] = _split_levels(S, wf, loc, part, roots, kept)[part[farm]]
+    out["fold_tris"], out["fold_tri_face"] = _fan_tris(S, far)
+    return out
+
+
+def _split_levels(S, wf, loc, part, roots, kept):
+    """How far each part of the welded shells moves when they are split, in units of Tiles
+    (per local face index of a part's root): the parts that stay 0, the others 1, 2... so
+    that no two parts sharing a UV vertex end up together - nothing stays welded or joined,
+    also where parts are folded over more than once (a Mirror on two axes: 1, 2 and 3)."""
+    level = np.zeros(wf.size, dtype=np.int64)
+    far_roots = roots[~kept[roots]]
+    if not far_roots.size:
+        return level
+    wc = np.flatnonzero(loc[S.lface] >= 0)  # corners of the welded shells' faces
+    n = max(wf.size, 1)
+    vp = np.unique(S.vid[wc] * n + part[loc[S.lface[wc]]])  # (UV vertex, part), once each
+    v, p = vp // n, vp % n
+    starts = np.flatnonzero(np.r_[True, v[1:] != v[:-1]])
+    sizes = np.diff(np.r_[starts, v.size])
+    near = {}  # part -> parts sharing a UV vertex with it
+    for a, k in zip(starts[sizes > 1].tolist(), sizes[sizes > 1].tolist()):
+        ps = p[a:a + k].tolist()
+        for x in ps:
+            near.setdefault(x, set()).update(ps)
+    taken = {int(r): 0 for r in roots[kept[roots]].tolist()}
+    for r in far_roots.tolist():  # (in face order: the parts of the faces first in the mesh first)
+        used = {taken[q] for q in near.get(r, ()) if q in taken}
+        c = 1
+        while c in used:
+            c += 1
+        taken[r] = c
+        level[r] = c
+    return level
 
 
 def _cofactor(M3):
@@ -1368,6 +1573,9 @@ class _Geometry:
                  "td_nshells", "td_uv_area", "td_world_area", "td_anchor", "td_tri_uv", "td_tri_shell",
                  # every shown shell (the arrays above cover the shells with a border, "gap shells")
                  "sh_n", "sh_obj", "sh_mat", "sh_anchor", "sh_orient", "sh_axis", "sh_gid",
+                 # welded overlaps: the UV edges a shell folds over at, the shells that do, and
+                 # what lies folded over (triangles)
+                 "fold_a", "fold_b", "fold_shell", "sh_welded", "fold_tris", "fold_tri_shell",
                  "gap_shell", "shell_mat", "mat_keys", "mat_total", "mat_vis", "obj_names", "obj_scale",
                  # the objects' own parts, for the caches and the operators
                  "obj_parts", "obj_src", "obj_uvsig", "sh_base", "src_serials")
@@ -1404,6 +1612,12 @@ class _Geometry:
         self.sh_orient = _EMPTY2
         self.sh_axis = np.empty(0, dtype=np.int8)
         self.sh_gid = _EMPTY_I
+        self.fold_a = _EMPTY2      # welded edges: UV of their ends,
+        self.fold_b = _EMPTY2
+        self.fold_shell = _EMPTY_I  # ... and their shell (all-shell index)
+        self.sh_welded = np.empty(0, dtype=bool)
+        self.fold_tris = np.empty((0, 3, 2))  # the faces lying folded over: fan triangles,
+        self.fold_tri_shell = _EMPTY_I        # ... and their shell (all-shell index)
         self.gap_shell = _EMPTY_I
         self.shell_mat = _EMPTY_I
         self.mat_keys = []
@@ -1424,7 +1638,9 @@ class _Parts:
     materials - what gaps, overlaps and stacks depend on -, `serial` with every extraction.
     Material ids are local to the object (`uniq`: its material keys, `lut`: set of each slot).
     fidx / face_shell / tot: mesh face, shell and corner count of each shown face; lid: the
-    mesh corner of each of their corners."""
+    mesh corner of each of their corners. gap["far"]: the shown faces (positions in fidx)
+    lying folded over onto the rest of their shell (welded overlaps), gap["far_level"]: how
+    far each moves when the shell is split (_split_levels)."""
     __slots__ = ("serial", "uv_sig", "A", "vis", "csel", "fm", "flags", "m3", "name", "scale", "fast",
                  "uniq", "lut", "total", "shown", "nfaces", "gap", "sh", "fidx", "face_shell", "lid", "tot")
 
@@ -1516,6 +1732,12 @@ def _extract_batch(todo, want_td, want_orient):
     none = np.zeros(n + 1, dtype=np.int64)
     t_off = np.searchsorted(sobj[gap["shells"]][gap["tri_gid"]], every) if gap["tri_gid"].size else none
     q_off = np.searchsorted(sobj[sh["tri_shell"]], every) if want_td and sh["tri_shell"].size else none
+    # welded overlaps (rare): edges by shell, folded-over faces and their triangles by face
+    folds = bool(gap["fold_shell"].size)
+    if folds:
+        w_off = np.searchsorted(sobj[gap["fold_shell"]], every)
+        x_off = np.searchsorted(gap["far"], f_off)
+        y_off = np.searchsorted(gap["fold_tri_face"], f_off)
     for i, P in enumerate(todo):
         f0, f1 = int(f_off[i]), int(f_off[i + 1])
         if f1 == f0:
@@ -1526,7 +1748,17 @@ def _extract_batch(todo, want_td, want_orient):
         P.nfaces = f1 - f0
         P.gap = {"shells": gap["shells"][g0:g1] - s0, "seg_a": gap["seg_a"][e0:e1], "seg_b": gap["seg_b"][e0:e1],
                  "sign": gap["sign"][e0:e1], "count": gap["count"][g0:g1], "sel": gap["sel"][g0:g1],
-                 "area2": gap["area2"][g0:g1], "tris": gap["tris"][t0:t1], "tri_gid": gap["tri_gid"][t0:t1] - g0}
+                 "area2": gap["area2"][g0:g1], "flip": gap["flip"][g0:g1],
+                 "tris": gap["tris"][t0:t1], "tri_gid": gap["tri_gid"][t0:t1] - g0}
+        if folds:
+            w0, w1, x0, x1, y0, y1 = (int(w_off[i]), int(w_off[i + 1]), int(x_off[i]), int(x_off[i + 1]),
+                                      int(y_off[i]), int(y_off[i + 1]))
+            P.gap.update({"fold_a": gap["fold_a"][w0:w1], "fold_b": gap["fold_b"][w0:w1],
+                          "fold_shell": gap["fold_shell"][w0:w1] - s0, "far": gap["far"][x0:x1] - f0,
+                          "far_level": gap["far_level"][x0:x1], "fold_tris": gap["fold_tris"][y0:y1],
+                          "fold_tri_shell": S.face_shell[gap["fold_tri_face"][y0:y1]] - s0})
+        else:
+            P.gap.update(_NO_FOLDS)
         P.sh = {"nshell": s1 - s0, "uv_area": sh["uv_area"][s0:s1], "anchor": sh["anchor"][s0:s1],
                 "mat": sh["mat"][s0:s1] - int(kbase[i])}
         if want_td:
@@ -1673,6 +1905,15 @@ def _assemble(parts, src=None, want_td=False, want_orient=False):
     geo.sh_mat = np.concatenate([p["mat"] for p in shs])
     geo.sh_anchor = np.concatenate([p["anchor"] for p in shs])
     geo.sh_gid = np.full(n, -1, dtype=np.int64)
+    geo.sh_welded = np.zeros(n, dtype=bool)
+    welded = [(g, b) for g, b in zip(gaps, base[:-1]) if g["fold_shell"].size]
+    if welded:
+        geo.fold_a = np.concatenate([g["fold_a"] for g, _b in welded]).reshape(-1, 2)
+        geo.fold_b = np.concatenate([g["fold_b"] for g, _b in welded]).reshape(-1, 2)
+        geo.fold_shell = np.concatenate([g["fold_shell"] + b for g, b in welded]).astype(np.int64)
+        geo.sh_welded[geo.fold_shell] = True
+        geo.fold_tris = np.concatenate([g["fold_tris"] for g, _b in welded]).astype(np.float64).reshape(-1, 3, 2)
+        geo.fold_tri_shell = np.concatenate([g["fold_tri_shell"] + b for g, b in welded]).astype(np.int64)
     if want_td:
         geo.td_nshells = n
         geo.td_uv_area = np.concatenate([p["uv_area"] for p in shs])
@@ -1706,7 +1947,7 @@ def _assemble(parts, src=None, want_td=False, want_orient=False):
     geo.bmax = np.maximum.reduceat(hi, geo.shell_off[:-1], axis=0)
     geo.nshells = S
     geo.shell_area = np.concatenate([g["area2"] for g in gaps]) * 0.5
-    geo.flipped = geo.shell_area < 0.0
+    geo.flipped = np.concatenate([g["flip"] for g in gaps]).astype(bool)
     geo.flip_tris = np.concatenate([g["tris"] for g in gaps]).astype(np.float64).reshape(-1, 3, 2)
     geo.flip_tri_shell = np.concatenate([g["tri_gid"] + b for g, b in zip(gaps, gbase[:-1])]).astype(np.int64)
     geo.tile = np.floor((geo.bmin + geo.bmax) * 0.5).astype(np.int64)
@@ -2788,6 +3029,75 @@ def _stacks_of(geo, same_mat, stack_match=STACK_MATCH, cache=None):
     return _merge_stacks(geo, grouped)
 
 
+# ---------------------------------------------------------------------------
+# Shells outside the 0-1 tile with no main there; shells under one texel
+# ---------------------------------------------------------------------------
+
+def _lost_shells(geo, same_mat, match):
+    """(lost, outside), bool per gap shell. Outside: the shell lies outside the 0-1 tile
+    (UDIM 1001; its tile is the one of its bounds' middle). Lost: outside, and moved back by
+    whole tiles it lies on no shell of the 0-1 tile by at least `match` - the stack rules,
+    mirrored copies included, per material with `same_mat`. A copy moved away from its main
+    has one there; a part moved out of the tile entirely, all its copies with it, has none,
+    and a bake of the 0-1 tile gives it nothing."""
+    S = geo.nshells
+    lost = np.zeros(S, dtype=bool)
+    outside = (geo.tile != 0).any(axis=1) if S else lost.copy()
+    if not outside.any():
+        return lost, outside
+    for _gkey, g in _shell_groups(geo, same_mat):
+        out_g = outside[g]
+        if not out_g.any():
+            continue
+        if out_g.all():
+            lost[g] = True
+            continue
+        sub = _sub_geometry(geo, g)
+        shift = geo.tile[g].astype(np.float64)  # (whole tiles: the copies moved away come back exactly)
+        seg_shift = shift[sub.seg_shell]
+        sub.seg_a, sub.seg_b = sub.seg_a - seg_shift, sub.seg_b - seg_shift
+        sub.bmin, sub.bmax = sub.bmin - shift, sub.bmax - shift
+        stacks = _find_stacks(sub, match)
+        has_main = np.zeros(g.size, dtype=bool)
+        has_main[stacks.rep[~out_g]] = True  # (the stacks with a shell of the 0-1 tile in them)
+        lost[g[out_g & ~has_main[stacks.rep]]] = True
+    return lost, outside
+
+
+def _lost_of(geo, s):
+    """_lost_shells of the geometry for the settings `s` (Same Material Only, Stack Match -
+    also with stacks off), kept while neither changes."""
+    match = max(0.5, min(1.0, float(s.stack_match) / 100.0))
+    key = (geo.src_serials, geo.nshells, bool(s.same_material), round(match, 6))
+    hit = _State.lost
+    if hit is None or hit[0] != key:
+        hit = _State.lost = (key, _lost_shells(geo, bool(s.same_material), match))
+    return hit[1]
+
+
+def _tiny_shells(geo, W, H):
+    """(bool per gap shell: less than one texture pixel wide or tall, (width, height) in
+    pixels per gap shell): the extent of its bounds along U and V at a W x H texture."""
+    size = (geo.bmax - geo.bmin) * np.array([float(W), float(H)])
+    return (size < 1.0).any(axis=1), size.reshape(-1, 2)
+
+
+class _Checks:
+    """Per gap shell, for drawing: lost (no main in the 0-1 tile; None: not looked for),
+    tiny (under one texel; None: not looked for) and its size in pixels. `key` tells what
+    they were found for."""
+    __slots__ = ("lost", "tiny", "tiny_px", "key")
+
+
+def _checks(geo, s, W, H):
+    """The checks drawn with the gap overlay that its settings ask for (_Checks)."""
+    ck = _Checks()
+    ck.lost = _lost_of(geo, s)[0] if s.show_lost else None
+    ck.tiny, ck.tiny_px = _tiny_shells(geo, W, H) if s.show_tiny else (None, None)
+    ck.key = (_State.lost[0] if s.show_lost else None, (W, H) if s.show_tiny else None)
+    return ck
+
+
 def _merge_pairs(S, parts):
     """Global _Pairs from per-group ones: parts [(g, pairs)]. Returns (pairs, index of each
     group's pairs in the result)."""
@@ -3528,6 +3838,17 @@ def _square_verts(C, h):
     return _rect_verts(np.column_stack((C[:, 0] - h, C[:, 1] - h, C[:, 0] + h, C[:, 1] + h)))
 
 
+def _ring_verts(C, r, n=16):
+    """Circles of radius r around the points C, as line segments."""
+    a = np.linspace(0.0, 2.0 * np.pi, n + 1)
+    ring = np.column_stack((np.cos(a), np.sin(a))) * r
+    P = C[:, None, :] + ring[None, :, :]
+    v = np.zeros((C.shape[0] * n * 2, 3), dtype=np.float32)
+    v[0::2, :2] = P[:, :-1].reshape(-1, 2)
+    v[1::2, :2] = P[:, 1:].reshape(-1, 2)
+    return v
+
+
 def _cross_verts(C, h):
     v = np.zeros((C.shape[0], 4, 3), dtype=np.float32)
     cx, cy = C[:, 0], C[:, 1]
@@ -3558,6 +3879,11 @@ def _gradient(d, min_px, needed_px, c_zero, c_min, c_needed):
     below = c_zero + (c_min - c_zero) * t1[:, None]
     above = c_min + (c_needed - c_min) * t2[:, None]
     return np.where((d < lo)[:, None], below, above)
+
+
+def _fmt_size(v):
+    """A size in pixels, for "Under 1 px": 0.42, 3.75, 12.3, 1500."""
+    return ("%.0f" % v) if v >= 99.95 else ("%.1f" % v) if v >= 9.995 else ("%.2f" % v)
 
 
 def _fmt_px(d):
@@ -3750,13 +4076,15 @@ def _td_fill_batch(geo, td, thr, alpha):
     return hit[0], hit[1], False
 
 
-def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_lines=True):
-    """`info`: (show object scale, show orientation arrows, show Flipped) for the per-shell info
-    blocks; by default Flipped follows the gap overlay and the other two are off. `stacks`
-    (_Stacks): a stack gets one block, on the shell standing for it - with `stack_lines`,
-    telling the number of shells in it. What differs between a stack's shells shows in that
-    block: the span of their densities ("256 - 512 px/m": copies of different size in the
-    scene), "Scale varies"."""
+def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_lines=True, checks=None):
+    """`info`: (show object scale, show orientation arrows, show Flipped, show Welded overlap,
+    show the gap labels) for the per-shell info blocks and the distances; by default the last
+    three follow the gap overlay and the first two are off. `checks` (_Checks): shells with no
+    main in the 0-1 tile and shells under 1 px, for their blocks. `stacks` (_Stacks): a stack
+    gets one block, on the shell
+    standing for it - with `stack_lines`, telling the number of shells in it. What differs
+    between a stack's shells shows in that block: the span of their densities ("256 - 512
+    px/m": copies of different size in the scene), "Scale varies"."""
     lab = _Labels()
     blf.size(FONT_ID, fsize)
     lab.th = th = float(blf.dimensions(FONT_ID, "0123456789")[1])
@@ -3767,14 +4095,20 @@ def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_l
     c2 = np.array(st.color_needed[:], dtype=np.float64)
     c_ov = np.array(st.color_overlap[:], dtype=np.float64)
     c_fl = tuple(float(c) for c in st.color_flipped[:])
+    c_wd = tuple(float(c) for c in st.color_welded[:])
+    c_lo = tuple(float(c) for c in st.color_lost[:])
+    c_ti = tuple(float(c) for c in st.color_tiny[:])
     if meas is not None:
         lab.gap_rgb = _gradient(meas.dist, st.min_px, st.needed_px, c0, c1, c2)
         lab.border_rgb = _gradient(meas.bdist, st.border_min_px, st.border_needed_px, c0, c1, c2)
     else:
         lab.gap_rgb = lab.border_rgb = np.empty((0, 3))
     if info is None:
-        info = (False, False, meas is not None and bool(st.show_flipped))
-    show_scale, show_orient, show_flip = info
+        info = (False, False, meas is not None and bool(st.show_flipped), meas is not None and bool(st.show_welded),
+                meas is not None and bool(st.show_gaps))
+    show_scale, show_orient, show_flip = info[:3]
+    show_weld = len(info) > 3 and bool(info[3])
+    show_gaps = len(info) <= 4 or bool(info[4])
 
     # problems first (tile crossings, overlaps), then the shells' info blocks (those with a
     # warning first), then distances by severity
@@ -3823,6 +4157,23 @@ def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_l
             flip[geo.gap_shell] = geo.flipped
             has |= flip
             warn |= flip
+        weld = geo.sh_welded.copy() if show_weld and geo.sh_welded.size == n else np.zeros(n, dtype=bool)
+        has |= weld
+        warn |= weld
+        lost = np.zeros(n, dtype=bool)
+        tiny = np.zeros(n, dtype=bool)
+        tiny_txt = {}
+        if checks is not None and geo.gap_shell.size == geo.nshells:
+            if checks.lost is not None and checks.lost.size == geo.nshells:
+                lost[geo.gap_shell[checks.lost]] = True
+            if checks.tiny is not None and checks.tiny.size == geo.nshells:
+                g = np.flatnonzero(checks.tiny)
+                tiny[geo.gap_shell[g]] = True
+                tiny_txt = dict(zip(geo.gap_shell[g].tolist(),
+                                    ["Under 1 px: %s × %s" % (_fmt_size(w), _fmt_size(h))
+                                     for w, h in checks.tiny_px[g].tolist()]))
+        has |= lost | tiny
+        warn |= lost | tiny
         arrow = (geo.sh_axis > 0) if show_orient and geo.sh_axis.size == n else np.zeros(n, dtype=bool)
         has |= arrow
         stack_txt = {}
@@ -3889,6 +4240,15 @@ def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_l
                 if flip[i]:
                     texts.append("Flipped")
                     cols.append(c_fl)
+                if weld[i]:
+                    texts.append("Welded overlap")
+                    cols.append(c_wd)
+                if lost[i]:
+                    texts.append("No main in 0-1")
+                    cols.append(c_lo)
+                if tiny[i]:
+                    texts.append(tiny_txt[i])
+                    cols.append(c_ti)
                 block.append(len(texts) - n0)
             counts.append(np.asarray(block, dtype=np.int64))
             rgbs.append(np.asarray(cols, dtype=np.float64).reshape(-1, 3))
@@ -3904,7 +4264,7 @@ def _build_labels(geo, meas, st, fsize, td_info, info=None, stacks=None, stack_l
             icons.append(ic)
             icon_rgb.append(icr)
 
-    if meas is not None:
+    if meas is not None and show_gaps:
         d_all = np.concatenate((meas.dist, meas.bdist))
         if d_all.size:
             severity = np.concatenate((meas.dist / max(float(st.needed_px), 1e-6),
@@ -4040,18 +4400,31 @@ def _arrow_verts(C, D, size):
 class _Frame:
     """Everything drawn in region pixels for one view of the data: reused as long as the
     view (pan / zoom / size), the data and the style stay the same."""
-    __slots__ = ("hl", "under", "lines", "fills", "boxes", "icons", "idx", "tx", "ty")
+    __slots__ = ("hl", "under", "lines", "weld", "fills", "boxes", "icons", "idx", "tx", "ty")
 
 
-def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl=None, stacks=None):
+def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl=None, stacks=None,
+                checks=None):
+    """`checks` (_Checks): shells with no main in the 0-1 tile and shells under 1 px to mark."""
     u0, v0, sx, sy = mapping
 
     def to_region(uv):
         return np.column_stack(((uv[:, 0] - u0) * sx, (uv[:, 1] - v0) * sy))
 
-    hl_p = []
+    hl_p, weld_p = [], []
     under_p, under_c = [], []
     lines_p, lines_c, fills_p, fills_c = [], [], [], []
+
+    def tint(tris, rgb):  # a fill of these UV triangles (k, 3, 2), where in view
+        T = to_region(tris.reshape(-1, 2)).reshape(-1, 3, 2)
+        vis = ((T[:, :, 0].max(axis=1) >= 0.0) & (T[:, :, 0].min(axis=1) <= rw) &
+               (T[:, :, 1].max(axis=1) >= 0.0) & (T[:, :, 1].min(axis=1) <= rh))
+        if vis.any():
+            T = T[vis].reshape(-1, 2)
+            v = np.zeros((T.shape[0], 3), dtype=np.float32)
+            v[:, :2] = T
+            under_p.append(v)
+            under_c.append(np.tile(np.array(rgb + (0.22 * alpha,), dtype=np.float32), (T.shape[0], 1)))
 
     # shells inside the texel density range: an outline under everything else
     if hl is not None and hl.any() and geo.seg_shell.size:
@@ -4072,15 +4445,7 @@ def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margi
             fl_rgb = tuple(st.color_flipped)
             tris = geo.flip_tris[flipped[geo.flip_tri_shell]] if geo.flip_tris.size else geo.flip_tris
             if tris.size:
-                T = to_region(tris.reshape(-1, 2)).reshape(-1, 3, 2)
-                vis = ((T[:, :, 0].max(axis=1) >= 0.0) & (T[:, :, 0].min(axis=1) <= rw) &
-                       (T[:, :, 1].max(axis=1) >= 0.0) & (T[:, :, 1].min(axis=1) <= rh))
-                if vis.any():
-                    T = T[vis].reshape(-1, 2)
-                    v = np.zeros((T.shape[0], 3), dtype=np.float32)
-                    v[:, :2] = T
-                    under_p.append(v)
-                    under_c.append(np.tile(np.array(fl_rgb + (0.22 * alpha,), dtype=np.float32), (T.shape[0], 1)))
+                tint(tris, fl_rgb)
             seg = flipped[geo.seg_shell]
             P, Q = to_region(geo.seg_a[seg]), to_region(geo.seg_b[seg])
             vis = _visible_segments(P, Q, rw, rh, margin)
@@ -4088,10 +4453,51 @@ def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margi
                 lines_p.append(_segment_verts(P[vis], Q[vis]))
                 lines_c.append(np.tile(np.array(fl_rgb + (alpha,), dtype=np.float32), (2 * int(vis.sum()), 1)))
 
+        # welded overlaps: what lies folded over, tinted; the welded edges, thick, over the lines
+        if st.show_welded and geo.fold_shell.size:
+            if geo.fold_tris.size:
+                tint(geo.fold_tris, tuple(st.color_welded))
+            P, Q = to_region(geo.fold_a), to_region(geo.fold_b)
+            vis = _visible_segments(P, Q, rw, rh, margin)
+            if vis.any():
+                weld_p.append(_segment_verts(P[vis], Q[vis]))
+
+        def outline(shells, rgb):  # the borders of these gap shells (bool per gap shell)
+            seg = shells[geo.seg_shell]
+            P, Q = to_region(geo.seg_a[seg]), to_region(geo.seg_b[seg])
+            vis = _visible_segments(P, Q, rw, rh, margin)
+            if vis.any():
+                lines_p.append(_segment_verts(P[vis], Q[vis]))
+                lines_c.append(np.tile(np.array(rgb + (alpha,), dtype=np.float32), (2 * int(vis.sum()), 1)))
+
+        # shells outside the 0-1 tile with no main there: tinted and outlined, as flipped ones
+        lost = checks.lost if checks is not None else None
+        if lost is not None and lost.size == geo.nshells and lost.any():
+            rgb = tuple(st.color_lost)
+            if geo.td_tri_uv.size and geo.td_tri_shell.size:
+                on = np.zeros(max(geo.sh_n, 1), dtype=bool)
+                on[geo.gap_shell[lost]] = True
+                tris = geo.td_tri_uv[on[geo.td_tri_shell]]
+                if tris.size:
+                    tint(tris, rgb)
+            outline(lost, rgb)
+
+        # shells under one texel: outlined, and ringed so that they can be found zoomed out
+        tiny = checks.tiny if checks is not None else None
+        if tiny is not None and tiny.size == geo.nshells and tiny.any():
+            rgb = tuple(st.color_tiny)
+            outline(tiny, rgb)
+            X = to_region((geo.bmin[tiny] + geo.bmax[tiny]) * 0.5)
+            X = X[_in_region(X, rw, rh, margin)]
+            if X.size:
+                R = _ring_verts(X, 2.0 * xh)
+                lines_p.append(R)
+                lines_c.append(np.tile(np.array(rgb + (alpha,), dtype=np.float32), (R.shape[0], 1)))
+
         # distances: gradient line from the border point + a marker on the border;
         # tile-border lines end in a tick along the tile edge
-        for p_uv, q_uv, rgb, axis in ((meas.p_uv, meas.q_uv, lab.gap_rgb, None),
-                                      (meas.bp_uv, meas.bf_uv, lab.border_rgb, meas.baxis)):
+        for p_uv, q_uv, rgb, axis in (((meas.p_uv, meas.q_uv, lab.gap_rgb, None),
+                                       (meas.bp_uv, meas.bf_uv, lab.border_rgb, meas.baxis)) if st.show_gaps else ()):
             if not p_uv.size:
                 continue
             P, Q = to_region(p_uv), to_region(q_uv)
@@ -4137,6 +4543,11 @@ def _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margi
                 if under_p and fsh is not None else None)
     fr.lines = (_batch(lsh, 'LINES', np.concatenate(lines_p), np.concatenate(lines_c))
                 if lines_p and lsh is not None else None)
+    fr.weld = None
+    if weld_p and lsh is not None:
+        WL = np.concatenate(weld_p)
+        fr.weld = _batch(lsh, 'LINES', WL, np.tile(np.array(tuple(st.color_welded) + (alpha,), dtype=np.float32),
+                                                   (WL.shape[0], 1)))
     fr.fills = (_batch(fsh, 'TRIS', np.concatenate(fills_p), np.concatenate(fills_c))
                 if fills_p and fsh is not None else None)
     fr.boxes = fr.icons = None
@@ -4204,7 +4615,9 @@ def _draw_overlay(context, region, st, geo, meas, W, H, stale, stacks=None, stac
         td_key = (W, H, scale, st.td_unit, thr)
         _State.td_uv_stats = _td_stats(td, thr)
     info = (bool(st.info_show and st.show_scale), bool(st.info_show and st.show_orientation),
-            bool(meas is not None and st.show_flipped))
+            bool(meas is not None and st.show_flipped), bool(meas is not None and st.show_welded),
+            bool(meas is not None and st.show_gaps))
+    checks = _checks(geo, st, W, H) if meas is not None and (st.show_lost or st.show_tiny) else None
 
     hl = hl_key = None
     if (st.td_range_highlight and td is not None and geo.gap_shell.size
@@ -4220,20 +4633,23 @@ def _draw_overlay(context, region, st, geo, meas, W, H, stale, stacks=None, stac
            float(st.min_px), float(st.needed_px),
            float(st.border_min_px), float(st.border_needed_px),
            tuple(st.color_zero), tuple(st.color_min), tuple(st.color_needed),
-           tuple(st.color_overlap), tuple(st.color_flipped), td_key, info, stacks_key, bool(st.info_show))
+           tuple(st.color_overlap), tuple(st.color_flipped), tuple(st.color_welded), tuple(st.color_lost),
+           tuple(st.color_tiny), td_key, info, stacks_key, bool(st.info_show),
+           checks.key if checks is not None else None)
     lab = _State.labels_cache.get(key)
     if lab is None:
-        lab = _build_labels(geo, meas, st, fsize, td_info, info, stacks, bool(st.info_show))
+        lab = _build_labels(geo, meas, st, fsize, td_info, info, stacks, bool(st.info_show), checks)
         _cache_put(_State.labels_cache, key, lab)
 
     fkey = (mapping, rw, rh, key, alpha, lw, dot, xh, lift, margin, pad,
-            bool(st.declutter), bool(st.label_background), bool(st.show_flipped), hl_key)
+            bool(st.declutter), bool(st.label_background), bool(st.show_flipped), bool(st.show_welded),
+            bool(st.show_gaps), bool(st.show_lost), bool(st.show_tiny), hl_key)
     rkey = region.as_pointer() if hasattr(region, "as_pointer") else id(region)
     hit = _State.frame.get(rkey)
     if hit is not None and hit[0] == fkey:
         fr = hit[1]
     else:
-        fr = _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl, stacks)
+        fr = _frame_data(st, geo, meas, lab, mapping, rw, rh, alpha, dot, xh, lift, margin, pad, hl, stacks, checks)
         _cache_put(_State.frame, rkey, (fkey, fr), size=8)
 
     gpu.state.blend_set('ALPHA')
@@ -4254,6 +4670,7 @@ def _draw_overlay(context, region, st, geo, meas, W, H, stale, stacks=None, stac
         _draw_batch('line', fr.hl, lw + 2.0 * ui, rw, rh)
         _draw_batch('fill', fr.under)
         _draw_batch('line', fr.lines, lw, rw, rh)
+        _draw_batch('line', fr.weld, max(2.0 * lw, lw + 2.0 * ui), rw, rh)
         _draw_batch('fill', fr.fills)
         if fr.idx.size:
             _draw_batch('fill', fr.boxes)
@@ -4715,8 +5132,9 @@ class UVGAP_OT_refresh(bpy.types.Operator):
 
 def _select_uv_faces(bm, uvl, sync, shown, picked, extend):
     """Select the UVs of the `picked` faces (with UV Sync Selection: the mesh faces), and
-    deselect the other `shown` faces unless extending. Whole shells only: shells share no
-    UV vertex, so setting one shell's corners never touches another's."""
+    deselect the other `shown` faces unless extending. Whole shells, or the part of a welded
+    shell lying folded over: what is set are the picked faces' own corners (shells share no
+    UV vertex)."""
     if sync:
         if extend and _UV_SELECT_ON_LOOP and bm.uv_select_sync_valid:
             # Blender 5.0+: add to the synced UV selection, then carry it over to the mesh
@@ -5104,6 +5522,18 @@ def _overlap_data(op, context):
     return objects, geo, stacks, _overlap_pairs(geo, same_mat, cache, smatch)
 
 
+def _in_home_tile(geo, shells):
+    """Whether each of the given shells (all-shell indices) lies in the 0-1 tile (UDIM 1001):
+    the middle of its bounds does; for a shell without a border, its label point."""
+    shells = np.asarray(shells, dtype=np.int64)
+    gid = geo.sh_gid[shells]
+    tile = np.floor(geo.sh_anchor[shells]).astype(np.int64).reshape(-1, 2)
+    g = gid >= 0
+    if g.any():
+        tile[g] = geo.tile[gid[g]]
+    return (tile[:, 0] == 0) & (tile[:, 1] == 0)
+
+
 def _but_one(geo, pairs, stacks, home_only):
     """All-shell indices of every shell lying on another but one per stack or set of
     overlapping shells: the one that stays isn't flipped (where there is such a shell). With
@@ -5114,6 +5544,29 @@ def _but_one(geo, pairs, stacks, home_only):
         tile = geo.tile[np.maximum(gid, 0)]
         shells = shells[(gid >= 0) & (tile[:, 0] == 0) & (tile[:, 1] == 0)]
     return shells
+
+
+def _moves(geo, shells):
+    """What All but One and Split move, per object of the geometry: (mesh faces, how many
+    times Tiles each moves). The given shells (all-shell indices) move once, whole. In every
+    welded shell, in every tile, what lies folded over moves on top of that by its level
+    (_split_levels): a mirrored half once more, so that it splits off its original - also
+    from a copy moved whole. Returns (per object (faces, times), welded shells split, most
+    times)."""
+    whole = np.zeros(max(geo.sh_n, 1), dtype=bool)
+    whole[np.asarray(shells, dtype=np.int64)] = True
+    out, split, most = [], 0, 0
+    for P, b in zip(geo.obj_parts, geo.sh_base):
+        times = whole[b:b + P.sh["nshell"]][P.face_shell].astype(np.int64)  # per shown face
+        far = P.gap["far"]
+        if far.size:
+            times[far] += P.gap["far_level"]
+            split += int(_unique(P.face_shell[far]).size)
+        m = np.flatnonzero(times)
+        out.append((P.fidx[m], times[m]) if m.size else (_EMPTY_I32, _EMPTY_I))
+        if m.size:
+            most = max(most, int(times[m].max()))
+    return out, split, most
 
 
 def _shell_face_ids(geo, shells):
@@ -5127,12 +5580,28 @@ def _shell_face_ids(geo, shells):
     return out
 
 
+def _all_but_one(geo, pairs, stacks, home_only):
+    """(per object: (mesh faces, times Tiles) All but One takes, shells taken whole, welded
+    shells split, most times): every shell lying on another but one per stack or overlap
+    (_but_one, by `home_only`), and what lies folded over in the welded shells of every tile
+    (_moves)."""
+    shells = _but_one(geo, pairs, stacks, home_only)
+    moves, nsplit, most = _moves(geo, shells)
+    return moves, int(shells.size), nsplit, most
+
+
 def _select_shells(context, objects, geo, shells, sync, extend):
     """Select the given shells (all-shell indices) of a geometry just read (_shown_geometry):
     their UVs, with UV Sync Selection their mesh faces. Without `extend` the other shown
     shells are deselected."""
+    _select_faces(context, objects, geo, _shell_face_ids(geo, shells), sync, extend)
+
+
+def _select_faces(context, objects, geo, picks, sync, extend):
+    """Select faces (per object of the geometry: mesh face indices) of a geometry just read
+    (_shown_geometry), as _select_shells does."""
     touched = []
-    for P, oi, pick in zip(geo.obj_parts, geo.obj_src, _shell_face_ids(geo, shells)):
+    for P, oi, pick in zip(geo.obj_parts, geo.obj_src, picks):
         if extend and not pick.size:
             continue
         obj = objects[oi]
@@ -5149,10 +5618,12 @@ def _select_shells(context, objects, geo, shells, sync, extend):
         _announce_selection(context, touched)
 
 
-def _move_shells(objects, geo, shells, du, dv):
-    """Move the UVs of the given shells (all-shell indices) by (du, dv)."""
+def _move_faces(objects, geo, moves, du, dv):
+    """Move the UVs of faces (per object of the geometry: (mesh faces, times)) by times x
+    (du, dv). Every face corner has a UV of its own: faces moved apart from the rest of their
+    shell split from it."""
     touched = []
-    for oi, pick in zip(geo.obj_src, _shell_face_ids(geo, shells)):
+    for oi, (pick, times) in zip(geo.obj_src, moves):
         if not pick.size:
             continue
         obj = objects[oi]
@@ -5161,11 +5632,12 @@ def _move_shells(objects, geo, shells, du, dv):
         uvl = bm.loops.layers.uv.active
         bm.faces.ensure_lookup_table()
         faces = bm.faces
-        for i in pick.tolist():
+        for i, t in zip(pick.tolist(), times.tolist()):
+            fu, fv = du * t, dv * t
             for loop in faces[i].loops:  # (every corner has its own UV: each is moved once)
                 luv = loop[uvl]
                 u, v = luv.uv
-                luv.uv = (u + du, v + dv)
+                luv.uv = (u + fu, v + fv)
         bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
         touched += (obj, me)
     _note_change(touched)
@@ -5175,15 +5647,70 @@ _OVERLAP_MODES = [
     ('OVERLAPPING', "Overlapping", "Select the shells that overlap and aren't a stack: copies that don't fit, "
                                    "shells lying partly on others (with all the shells of the stacks involved)"),
     ('STACKED', "Stacked", "Select every shell lying in a stack: shells sharing texture space on purpose"),
-    ('BUT_ONE', "All but One", "Select all the shells lying on others but one of every stack and overlap: a "
-                               "shell that isn't flipped stays unselected (where there is one)"),
+    ('BUT_ONE', "All but One", "Select all the shells lying on others but one of every stack and overlap - a "
+                               "shell that isn't flipped stays unselected (where there is one) -, and of every "
+                               "welded shell, in every tile, the part lying folded over onto the rest"),
+    ('WELDED', "Welded", "Select the shells welded onto themselves: shells that fold over at UV edges two of "
+                         "their faces share, as a Mirror modifier with Merge leaves them when it is applied "
+                         "without a UV offset"),
+    ('LOST', "No Main in 0-1", "Select the shells lying outside the 0-1 tile that have no main there: moved "
+                               "back by whole tiles, they lie on no shell of the 0-1 tile"),
+    ('OUTSIDE', "Outside 0-1", "Select every shell lying outside the 0-1 tile (UDIM 1001): the middle of its "
+                               "bounds is outside"),
+    ('TINY', "Under 1 px", "Select the shells less than one texture pixel wide or tall (at the Texture "
+                           "resolution)"),
 ]
+
+
+def _but_one_note(nwhole, nsplit, done):
+    """What All but One took, for a report: "3 shells and the folded-over part of 1 welded
+    shell <done>"; None when nothing."""
+    what = []
+    if nwhole:
+        what.append(_plural(nwhole, "shell"))
+    if nsplit:
+        what.append("the folded-over part of " + _plural(nsplit, "welded shell"))
+    return " and ".join(what) + " " + done if what else None
+
+
+def _moved_note(tiles, most):
+    """"moved 3 tiles along U" - and how far the farthest went when parts went 2, 3... times."""
+    note = "moved %d tile%s along U" % (tiles, "" if abs(tiles) == 1 else "s")
+    if most > 1:
+        note += " (parts folded over more than once: up to %d)" % (tiles * most)
+    return note
+
+
+def _checked_shells(context, mode, geo):
+    """All-shell indices of the shown shells a check picks: 'WELDED', 'LOST' (no main in the
+    0-1 tile), 'OUTSIDE' (outside the 0-1 tile), 'TINY' (under one texel); with a report
+    line."""
+    st = context.scene.uv_gap_overlay
+    if mode == 'WELDED':
+        shells = np.flatnonzero(geo.sh_welded)
+        return shells, ("%s selected" % _plural(int(shells.size), "welded shell") if shells.size
+                        else "No welded overlaps")
+    if mode == 'OUTSIDE':
+        shells = np.flatnonzero(~_in_home_tile(geo, np.arange(geo.sh_n)))
+        return shells, ("%s outside the 0-1 tile selected" % _plural(int(shells.size), "shell") if shells.size
+                        else "No shells outside the 0-1 tile")
+    if mode == 'LOST':
+        lost, outside = _lost_of(geo, st)
+        shells = geo.gap_shell[lost]
+        return shells, ("%s with no main in the 0-1 tile selected (of %d outside)"
+                        % (_plural(int(shells.size), "shell"), int(outside.sum())) if shells.size
+                        else "Every shell outside the 0-1 tile has a main there" if outside.any()
+                        else "No shells outside the 0-1 tile")
+    W, H, _src = _resolve_resolution(st, context.space_data)
+    shells = geo.gap_shell[_tiny_shells(geo, W, H)[0]]
+    return shells, ("%s under 1 px selected (at %d x %d)" % (_plural(int(shells.size), "shell"), W, H)
+                    if shells.size else "No shells under 1 px (at %d x %d)" % (W, H))
 
 
 class UVGAP_OT_select_overlaps(bpy.types.Operator):
     bl_idname = "uv.gap_overlay_select_overlaps"
-    bl_label = "Select Overlapping Shells"
-    bl_description = "Select UV shells lying on each other (with UV Sync Selection the mesh faces)"
+    bl_label = "Select Shells"
+    bl_description = "Select UV shells lying on each other, or found by a check (with UV Sync Selection the mesh faces)"
     bl_options = {'REGISTER', 'UNDO'}
 
     mode: EnumProperty(name="Shells", items=_OVERLAP_MODES, default='OVERLAPPING')
@@ -5210,10 +5737,29 @@ class UVGAP_OT_select_overlaps(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
+        sync = bool(context.scene.tool_settings.use_uv_select_sync)
+        if self.mode in ('WELDED', 'LOST', 'OUTSIDE', 'TINY'):  # (found with the shells: no overlap search)
+            objects, geo = _shown_geometry(context)
+            if geo is None or not geo.sh_n:
+                self.report({'WARNING'}, "No UV shells shown")
+                return {'CANCELLED'}
+            shells, note = _checked_shells(context, self.mode, geo)
+            _select_shells(context, objects, geo, shells, sync, self.extend)
+            _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+            self.report({'INFO'}, note)
+            return {'FINISHED'}
         got = _overlap_data(self, context)
         if got is None:
             return {'CANCELLED'}
         objects, geo, stacks, pairs = got
+        if self.mode == 'BUT_ONE':
+            moves, nwhole, nsplit, _most = _all_but_one(geo, pairs, stacks, self.home_only)
+            note = _but_one_note(nwhole, nsplit, "selected: one shell of every stack and overlap stays")
+            _select_faces(context, objects, geo, [f for f, _t in moves], sync, self.extend)
+            _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+            self.report({'INFO'}, note or ("No shells lie on each other" +
+                                           (" in the 0-1 tile" if self.home_only else "")))
+            return {'FINISHED'}
         if self.mode == 'STACKED':
             if stacks is None:
                 self.report({'WARNING'}, "Stacks are off: turn on Stacked Shells as One")
@@ -5221,17 +5767,12 @@ class UVGAP_OT_select_overlaps(bpy.types.Operator):
             shells = geo.gap_shell[np.flatnonzero(stacks.size > 1)]
             note = ("%s selected in %s" % (_plural(int(shells.size), "stacked shell"), _plural(stacks.counts()[0], "stack"))
                     if shells.size else "No stacked shells")
-        elif self.mode == 'BUT_ONE':
-            shells = _but_one(geo, pairs, stacks, self.home_only)
-            note = ("%s selected: one shell of every stack and overlap stays" % _plural(int(shells.size), "shell")
-                    if shells.size else "No shells lie on each other" + (" in the 0-1 tile" if self.home_only else ""))
         else:
             shells = _overlapping_shells(geo, pairs, stacks)
             note = ("%s selected (%s)" % (_plural(int(shells.size), "overlapping shell"),
                                          _plural(len(pairs), "overlapping pair"))
                     if shells.size else "No overlapping shells" + (" (stacks aside)" if stacks is not None else ""))
-        _select_shells(context, objects, geo, shells, bool(context.scene.tool_settings.use_uv_select_sync),
-                       self.extend)
+        _select_shells(context, objects, geo, shells, sync, self.extend)
         _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
         self.report({'INFO'}, note)
         return {'FINISHED'}
@@ -5241,7 +5782,9 @@ class UVGAP_OT_move_overlaps(bpy.types.Operator):
     bl_idname = "uv.gap_overlay_move_overlaps"
     bl_label = "Move All but One"
     bl_description = ("Move all the shells lying on others to another UDIM tile, leaving one of every stack and "
-                      "overlap in place - a shell that isn't flipped (where there is one)")
+                      "overlap in place - a shell that isn't flipped (where there is one). Every welded shell, in "
+                      "every tile, is split: the part lying folded over moves, as a Mirror modifier's UV offset "
+                      "would have placed it")
     bl_options = {'REGISTER', 'UNDO'}
 
     tiles: IntProperty(
@@ -5266,17 +5809,59 @@ class UVGAP_OT_move_overlaps(bpy.types.Operator):
         if got is None:
             return {'CANCELLED'}
         objects, geo, stacks, pairs = got
-        shells = _but_one(geo, pairs, stacks, self.home_only)
-        if not shells.size:
+        moves, nwhole, nsplit, most = _all_but_one(geo, pairs, stacks, self.home_only)
+        if not (nwhole or nsplit):
             self.report({'INFO'}, "No shells lie on each other%s: nothing to move"
                         % (" in the 0-1 tile" if self.home_only else ""))
             return {'CANCELLED'}
         if self.select:
-            _select_shells(context, objects, geo, shells, bool(context.scene.tool_settings.use_uv_select_sync), False)
-        _move_shells(objects, geo, shells, float(self.tiles), 0.0)
+            _select_faces(context, objects, geo, [f for f, _t in moves],
+                          bool(context.scene.tool_settings.use_uv_select_sync), False)
+        _move_faces(objects, geo, moves, float(self.tiles), 0.0)
         _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
-        self.report({'INFO'}, "%s moved %d tile%s along U; one shell of every stack and overlap stays" % (
-            _plural(int(shells.size), "shell"), self.tiles, "" if abs(self.tiles) == 1 else "s"))
+        self.report({'INFO'}, _but_one_note(nwhole, nsplit, _moved_note(self.tiles, most) +
+                                            "; one shell of every stack and overlap stays"))
+        return {'FINISHED'}
+
+
+class UVGAP_OT_split_welded(bpy.types.Operator):
+    bl_idname = "uv.gap_overlay_split_welded"
+    bl_label = "Split Welded Overlaps"
+    bl_description = ("Split every welded shell, in every tile: the part lying folded over onto it (a mirrored "
+                      "half) moves by Tiles UDIM tiles along U, as the Mirror modifier's Offset U would have "
+                      "placed it, and the rest stays. Parts folded over more than once (a Mirror on two axes) go "
+                      "2, 3... times as far, so that none stays welded")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    tiles: IntProperty(
+        name="Tiles", description="How many UDIM tiles to move along U (negative: to the left)",
+        default=1, min=-99, max=99)
+    select: BoolProperty(
+        name="Select Moved Parts", description="Select what was moved", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        if not self.tiles:
+            self.report({'WARNING'}, "Tiles is 0: nothing to move")
+            return {'CANCELLED'}
+        objects, geo = _shown_geometry(context)
+        if geo is None or not geo.sh_n:
+            self.report({'WARNING'}, "No UV shells shown")
+            return {'CANCELLED'}
+        moves, nsplit, most = _moves(geo, _EMPTY_I)
+        if not nsplit:
+            self.report({'INFO'}, "No welded overlaps: nothing to split")
+            return {'CANCELLED'}
+        if self.select:
+            _select_faces(context, objects, geo, [f for f, _t in moves],
+                          bool(context.scene.tool_settings.use_uv_select_sync), False)
+        _move_faces(objects, geo, moves, float(self.tiles), 0.0)
+        _redraw_areas(('IMAGE_EDITOR', 'VIEW_3D'))
+        self.report({'INFO'}, "%s split: the folded-over part %s" % (_plural(nsplit, "welded shell"),
+                                                                   _moved_note(self.tiles, most)))
         return {'FINISHED'}
 
 
@@ -5445,9 +6030,27 @@ class UVGAP_PT_main(_UVGapPanel, bpy.types.Panel):
         col.prop(st, "same_material")
 
         layout.separator()
+        sel = UVGAP_OT_select_overlaps.bl_idname
+        row = layout.row(align=True, heading="Gaps")
+        row.prop(st, "show_gaps", text="Show")
         row = layout.row(align=True, heading="Flipped Shells")
         row.prop(st, "show_flipped", text="Show")
         row.operator(UVGAP_OT_select_flipped.bl_idname, text="Select", icon='RESTRICT_SELECT_OFF')
+        row = layout.row(align=True, heading="Welded Overlaps")
+        row.prop(st, "show_welded", text="Show")
+        row.operator(sel, text="Select", icon='RESTRICT_SELECT_OFF').mode = 'WELDED'
+        row.operator(UVGAP_OT_split_welded.bl_idname, text="Split").tiles = st.stack_tiles
+        row = layout.row(align=True, heading="No Main in 0-1")
+        row.prop(st, "show_lost", text="Show")
+        row.operator(sel, text="Select", icon='RESTRICT_SELECT_OFF').mode = 'LOST'
+        row = layout.row(align=True, heading="Under 1 px")
+        row.prop(st, "show_tiny", text="Show")
+        row.operator(sel, text="Select", icon='RESTRICT_SELECT_OFF').mode = 'TINY'
+        split = layout.split(factor=0.4)  # (as a property row: the label in the left column)
+        left = split.row()
+        left.alignment = 'RIGHT'
+        left.label(text="Outside 0-1 Tile")
+        split.operator(sel, text="Select All", icon='RESTRICT_SELECT_OFF').mode = 'OUTSIDE'
 
         box = layout.box()
         col = box.column(align=True)
@@ -5486,6 +6089,18 @@ class UVGAP_PT_main(_UVGapPanel, bpy.types.Panel):
             tucked = int(np.count_nonzero(geo.flipped & ~geo.flipped[stacks.rep])) if stacks is not None else 0
             col.label(text="Flipped shells: %d" % nflip + (" (%d in stacks)" % tucked if tucked else ""),
                       icon='ERROR' if nflip > tucked else 'CHECKMARK')
+            welded = np.flatnonzero(geo.sh_welded)
+            col.label(text="Welded overlaps: %d" % welded.size, icon='ERROR' if welded.size else 'CHECKMARK')
+            weld_home = int(np.count_nonzero(_in_home_tile(geo, welded)))
+            if weld_home != welded.size:
+                col.label(text="%d of them in the 0-1 tile" % weld_home, icon='ERROR' if weld_home else 'CHECKMARK')
+            lost, outside = _lost_of(geo, st)
+            nlost, nout = int(np.count_nonzero(lost)), int(np.count_nonzero(outside))
+            col.label(text="No main in the 0-1 tile: %d" % nlost + (" (of %d outside)" % nout if nout else ""),
+                      icon='ERROR' if nlost else 'CHECKMARK')
+            W, H, _src = _resolve_resolution(st, context.space_data)
+            ntiny = int(np.count_nonzero(_tiny_shells(geo, W, H)[0]))
+            col.label(text="Under 1 px: %d" % ntiny, icon='ERROR' if ntiny else 'CHECKMARK')
         layout.operator(UVGAP_OT_refresh.bl_idname, icon='FILE_REFRESH')
 
 
@@ -5545,6 +6160,12 @@ class UVGAP_PT_overlaps(_UVGapPanel, bpy.types.Panel):
             if meas is not None and meas.overlap_pairs >= 100:
                 box.label(text="Many overlaps: if copies are placed", icon='INFO')
                 box.label(text="less exactly, lower Stack Match")
+        nweld = int(np.count_nonzero(geo.sh_welded)) if context.mode == 'EDIT_MESH' and geo is not None else 0
+        if nweld:
+            box = layout.box().column(align=True)
+            box.label(text="%s: All but One takes" % _plural(nweld, "welded shell"), icon='INFO')
+            box.label(text="what lies folded over (a mirrored")
+            box.label(text="half), in every tile")
 
 
 class UVGAP_PT_tiles(_UVGapPanel, bpy.types.Panel):
@@ -5604,6 +6225,9 @@ class UVGAP_PT_colors(_UVGapPanel, bpy.types.Panel):
         col = layout.column(align=True)
         col.prop(st, "color_overlap")
         col.prop(st, "color_flipped")
+        col.prop(st, "color_welded")
+        col.prop(st, "color_lost")
+        col.prop(st, "color_tiny")
 
 
 class UVGAP_PT_info(_UVGapPanel, bpy.types.Panel):
@@ -5629,7 +6253,8 @@ class UVGAP_PT_info(_UVGapPanel, bpy.types.Panel):
         box = layout.box().column(align=True)
         box.label(text="One block per shell:", icon='INFO')
         box.label(text="texel density (Texel Density panel),")
-        box.label(text="object scale, Flipped (with UV Shell Gaps)")
+        box.label(text="object scale; with UV Shell Gaps: Flipped,")
+        box.label(text="Welded overlap, No main in 0-1, Under 1 px")
         box.label(text="A stack has one block: × 4 = four shells")
         box.label(text="Blue arrow: the scene's up (+Z) on the shell")
         box.label(text="Green arrow: +Y, on shells lying flat")
@@ -5763,6 +6388,7 @@ _classes = (
     UVGAP_OT_select_flipped,
     UVGAP_OT_select_overlaps,
     UVGAP_OT_move_overlaps,
+    UVGAP_OT_split_welded,
     UVGAP_OT_material_select,
     UVGAP_OT_material_visibility,
     UVGAP_OT_material_check,

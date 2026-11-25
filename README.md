@@ -4,9 +4,9 @@
 
 # UV Shell Gap Overlay
 
-A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, and flipped (mirrored) shells. Shells stacked on each other on purpose, such as copies of a part sharing texture space, are told apart from real overlaps: a stack counts as one shell, and its copies can be selected or moved to another UDIM tile with one click.
+A Blender add-on that shows, directly on your UV layout, how many texture pixels separate neighboring UV shells, how far shells sit from their UDIM tile border, and the texel density of every shell. Gap measurements are color-graded against the padding you need. Texel density is color-graded against the density you need, in the UV Editor and on the mesh in the 3D Viewport. Each shell gets one compact info block with its density, its object's scale, whether it is flipped, and an arrow showing which way is up in the scene. Material sets let you select, hide and reveal the shells of chosen materials and measure gaps only within a material. Problems are called out where they happen: overlapping shells, shells crossing a tile border, flipped (mirrored) shells, shells welded onto themselves (as a Mirror modifier leaves them when it is applied without a UV offset), shells moved out of the 0–1 tile with nothing left there to take their texture from, and shells less than a pixel wide or tall. Shells stacked on each other on purpose, such as copies of a part sharing texture space, are told apart from real overlaps: a stack counts as one shell, and its copies can be selected or moved to another UDIM tile with one click.
 
-**Version:** 1.5.0 · **Blender:** 3.6 LTS to 5.3 · **License:** GPL-3.0-or-later
+**Version:** 1.6.0 · **Blender:** 3.6 LTS to 5.3 · **License:** GPL-3.0-or-later
 
 ---
 
@@ -16,15 +16,19 @@ A Blender add-on that shows, directly on your UV layout, how many texture pixels
 - **Color gradient.** Red at 0 px, yellow at your *Minimal* gap, green at your *Needed* gap and above.
 - **Overlap detection.** Points that fall inside another shell are labeled **Overlap**. Overlapping shell pairs are also found between the points: crossing borders, a shell inside another, copies that don't sit exactly on each other.
 - **Stacks.** Shells that cover each other almost completely (99.9 % by default) are a stack: copies of a part, mirrored halves, anything laid on the same texture space on purpose. A stack is measured as one shell and is not reported as an overlap. Its info block says how many shells it holds. See [Overlaps and stacks](#overlaps-and-stacks).
-- **Select and move overlaps.** Buttons select the overlapping shells, the stacked shells, or all but one shell of every stack and overlap. *Move All but One* sends those to another UDIM tile and leaves one shell in place, an unflipped one where there is one.
+- **Select and move overlaps.** Buttons select the overlapping shells, the stacked shells, or all but one shell of every stack and overlap. *Move All but One* sends those to another UDIM tile and leaves one shell in place, an unflipped one where there is one. Welded shells are split the same way, in every tile: their mirrored half goes, the original stays.
 - **Same material only.** Gaps and overlaps can be limited to shells of the same material, since each material usually has its own texture.
 - **UDIM tile borders.** Shells near the edge of their tile show their distance to it, with separate *Border Minimal / Needed* thresholds. Shells crossing a tile line are flagged.
 - **Flipped shells.** Mirrored shells are highlighted, and a single button selects them.
+- **Welded overlaps.** A Mirror modifier with *Merge* on, applied without a UV offset, leaves the mirrored half lying exactly on the original and welded to it along the mirror seam: one shell, overlapping itself, that no comparison between shells can find. The welded edges are drawn thick and red, the half lying on top is tinted, and the shell's info block says **Welded overlap**. *Split* moves every mirrored half off its original. See [Welded overlaps](#welded-overlaps).
+- **No main in 0–1.** Copies moved to another tile are fine as long as their original stays in the 0–1 tile, the one that gets baked. A shell outside the 0–1 tile whose original isn't there (it was moved out too, or it never was a copy) gets nothing from the bake. These shells are tinted orange and say **No main in 0-1**. Buttons select them, or every shell outside the 0–1 tile. See [No main in the 0–1 tile](#no-main).
+- **Under 1 px.** Shells less than one texture pixel wide or tall, at the texture size set in the panel, are outlined and ringed in cyan and say how big they are, for example `Under 1 px: 0.42 × 12.3`. The ring keeps them findable when they are too small to see.
+- **Gaps on or off.** The distance lines and their labels have a switch of their own: turn them off to look at overlaps, flipped, welded and the other marks alone.
 - **Texel density per shell.** Every shell is tinted by its texel density: red at your *Low* value, green at *Needed*, blue at *High*, with a gradient in between. Values are shown in px/cm, px/m, px/in or px/ft. See [Texel density](#texel-density).
 - **Auto Low / High.** *Low* and *High* can fill themselves with the lowest and highest density of the material sets you check, and stay editable.
 - **Select by texel density.** A From / To range over the analyzed densities selects every shell inside it. The shells in range are outlined.
 - **Texel density in the 3D Viewport.** The same colors on the mesh itself. In Edit Mode they cover the objects being edited; in Object Mode, the selected objects, modifiers included.
-- **One info block per shell.** Texel density, object scale (when it is not 1), *Flipped*, and an optional orientation arrow share one box per shell, so they never cover each other.
+- **One info block per shell.** Texel density, object scale (when it is not 1), *Flipped*, *Welded overlap*, *No main in 0-1*, *Under 1 px* and an optional orientation arrow share one box per shell, so they never cover each other.
 - **Orientation arrows.** An arrow on each shell points where the scene's up direction (+Z) runs across it. Shells lying flat get a +Y arrow instead.
 - **Material sets.** A list of the materials on the shown objects, with shell counts and density ranges. Select, hide or reveal the shells of one material or of several checked ones.
 - **Adjustable.** Texture resolution (presets, custom non-square, or the image open in the editor), number of points, point position along the border, font size, opacity, line width, and colors.
@@ -38,7 +42,7 @@ The add-on comes in two forms with the same code inside. Install only one of the
 
 | File | Blender | Installs as |
 |---|---|---|
-| `uv_shell_gap_overlay-1.5.0.zip` | 4.2 and later | Extension |
+| `uv_shell_gap_overlay-1.6.0.zip` | 4.2 and later | Extension |
 | `uv_shell_gap_overlay.py` | 3.6 and later | Legacy add-on |
 
 **Blender 4.2 and later (4.5, 5.x)**
@@ -61,14 +65,17 @@ You can also drag the `.zip` from your file browser into the Blender window.
 
 | Blender | Status |
 |---|---|
-| 5.3 | Checked with 5.3.0: installing, measuring, the buttons and the drawing |
-| 5.0, 5.1, 5.2 LTS | Tested with 5.0.1, 5.1.2 and 5.2.2 |
-| 4.2 LTS, 4.5 LTS | Tested with 4.2.23 and 4.5.14 |
+| 5.0, 5.1, 5.2 LTS, 5.3 | Tested with 5.0.1, 5.1.2, 5.2.4 and 5.3.0 |
+| 4.2 LTS, 4.5 LTS | Tested with 4.2.23 and 4.5.17 |
 | 3.6 LTS | Supported with the `.py` file. Not covered by the tests inside Blender: see below |
 
-"Tested" means the automated test suite passes in that version, run with the NumPy that Blender release ships (1.24 for 4.2, 1.26 for 4.5 and 5.0, 2.3 for 5.1 and 5.2). It covers gap measurements, stacks and overlaps, the select and move buttons, texel density, material sets, selection, hiding and revealing, info blocks, panels and drawing (UV Editor and 3D Viewport), plus installing, enabling and removing both the `.zip` and the `.py`. Two tests check what the add-on keeps between redraws: one makes 200 random edits, the other presses the buttons in random order between edits (runs of 120 to 300 steps), and after every step what is shown must equal a computation from nothing. *Select Flipped*, which now shares its code with the other Select buttons, is checked to select the same faces as in 1.4.0. The drawing was also checked in real renders (Blender 5.2).
+"Tested" means that these tests of 1.6.0 pass in that version, run with the NumPy that Blender release ships (1.24 for 4.2, 1.26 for 4.5 and 5.0, 2.3 for 5.1 to 5.3):
+- **Welded overlaps**, with real Mirror modifiers applied: on X, on X and Y, and for comparison with *Offset U* 1, with *Merge* off and with *Mirror U*. What is found, how the welded shell is measured, the Select, All but One and Move buttons with UV Sync Selection on and off, the info block and the panels. The welded edges found were also compared with an independent overlap test on 35 unwraps of 7 primitive meshes. After each of 150 random UV edits (faces and vertices moved, faces folded over, faces hidden), what the overlay keeps between redraws equals a computation from nothing. The drawing was checked in real renders in 5.2 and 5.3.
+- **The other checks of 1.6.0**: which shells have no main in the 0–1 tile (copies, mirrored copies, a stack moved out whole, other materials, an edited copy, a copy in the tile below), which are under 1 px at two texture sizes, Split, the select buttons, *Gaps: Show* off, and the panels.
+- **1.6.0 against 1.5.0** on 12 scenes without welded overlaps, each measured with three sets of settings, the new checks off: shells, borders, gaps, overlaps, stacks, labels and what *All but One* takes are equal, value by value. The code of texel density, material sets, hiding and revealing, which 1.5.0's full test suite covered, is unchanged.
+- **Installing**, enabling and removing both the `.zip` and the `.py`, with a scene of known problems, the buttons and the drawing.
 
-There is no Blender 3.6 build the tests can run in. For 3.6, the measuring code (shells, stacks, overlaps, gaps, labels) is run on its own under Python 3.10 with NumPy 1.23.5, the versions Blender 3.6 ships, and gives the same results as in 4.5 and 5.2. The parts that talk to Blender itself are those 1.4 already used in 3.6, plus three calls that the 3.6 documentation lists (a mesh's count of selected faces and vertices, a button's own tooltip, and the view layer's update). Undo of the new buttons relies on Blender's standard operator undo and could not be run in the headless tests.
+There is no Blender 3.6 build the tests can run in. For 3.6, the measuring code (shells, welded overlaps, stacks, overlaps, gaps, labels, what *All but One* takes, no main in 0–1, under 1 px) is run on its own under Python 3.10 with NumPy 1.23.5, the versions Blender 3.6 ships, and gives the same results as in Blender 5.2 on 8 scenes, welded shells included. 1.6.0 adds no call to Blender that 1.5.0 didn't make. Undo of the buttons relies on Blender's standard operator undo and could not be run in the headless tests.
 
 ---
 
@@ -81,8 +88,9 @@ There is no Blender 3.6 build the tests can run in. For 3.6, the measuring code 
 5. For texel density, tick the header checkbox of the **Texel Density** panel. Then pick a unit and set **Needed**. *Low* and *High* fill themselves from your shells while *Auto Low / High* is on.
 6. To see the colors on the mesh, tick **Show in 3D Viewport**. The same settings are also in the 3D Viewport's sidebar, **UV Gaps** tab.
 7. To work per material, use the **Materials** panel: check sets, then **Select**, **Hide** or **Reveal**.
-8. To deal with shells lying on each other, open **Overlaps and Stacks**: select them, or press **Move All but One** to send every copy to the next UDIM tile.
-9. For orientation arrows, open **Shell Info** and tick **Orientation Arrows**.
+8. To deal with shells lying on each other, open **Overlaps and Stacks**: select them, or press **Move All but One** to send every copy, and every mirrored half welded to its original, to the next UDIM tile.
+9. Read the summary box. Welded overlaps, shells with no main in the 0–1 tile and shells under 1 px each have a row with *Show* and *Select*. To look at them without the distance labels, untick **Gaps: Show**.
+10. For orientation arrows, open **Shell Info** and tick **Orientation Arrows**.
 
 The overlays update as you edit.
 
@@ -141,8 +149,11 @@ Tick **Show in 3D Viewport** in the same panel, or the header checkbox of the **
 | Magenta ✕ with **Overlap** | The point lies inside another shell, or two shell borders cross there. Shells of one stack don't mark each other. |
 | Magenta ✕ with **Crosses tile** | The shell straddles a UDIM tile line. |
 | Blue tint and blue outline | The shell's UVs are mirrored; its info block says **Flipped**. A mirrored copy lying in a stack with an unflipped shell is not tinted. |
+| Thick red line and a red tint, **Welded overlap** | The shell is welded onto itself along the red edges, and the tinted faces lie folded over onto the rest of it, typically a mirrored half on its original. See [Welded overlaps](#welded-overlaps). |
+| Orange tint and outline, **No main in 0-1** | The shell lies outside the 0–1 tile, and no shell of the 0–1 tile matches it: a bake of the 0–1 tile gives it nothing. See [No main in the 0–1 tile](#no-main). |
+| Cyan outline and ring, **Under 1 px: 0.42 × 12.3** | The shell is less than one texture pixel wide or tall; the block gives its width × height in pixels. |
 | Shell tinted red to blue | The shell's texel density (see below). Gray: the shell has no 3D area. |
-| Info block on a shell | One box per shell: its density (`512 px/m`), `Scale 1.5` in orange when its object's scale is not 1, **Flipped**, and an arrow on the left. |
+| Info block on a shell | One box per shell: its density (`512 px/m`), `Scale 1.5` in orange when its object's scale is not 1, **Flipped**, **Welded overlap**, **No main in 0-1**, **Under 1 px**, and an arrow on the left. |
 | `× 4` in an info block | A stack of four shells; the block stands for all of them. `× 4 (1 flipped)` when some, but not all, are mirrored. |
 | `256 – 512 px/m` in a stack's block | The shells of the stack differ in texel density: the same UVs are used by parts of different size. |
 | `Scale varies` in a stack's block | The stack's shells belong to objects with different scale. |
@@ -156,7 +167,7 @@ Tick **Show in 3D Viewport** in the same panel, or the header checkbox of the **
 
 **Texel density colors:** red at Low and below → yellow → green at Needed → cyan → blue at High and above. With Low 100, Needed 300 and High 500 px/m, a shell at 200 px/m is yellow and one at 400 px/m is cyan.
 
-**Label priority:** tile crossings and overlaps come first, then the info blocks (those with a scale note, a density span or *Flipped* first), then the smallest distances relative to their target. With *Hide Overlapping* on, less important labels that would cover them are skipped. Lines and colors are always drawn.
+**Label priority:** tile crossings and overlaps come first, then the info blocks (those with a scale note, a density span or a warning first), then the smallest distances relative to their target. With *Hide Overlapping* on, less important labels that would cover them are skipped. Lines and colors are always drawn.
 
 ---
 
@@ -168,7 +179,7 @@ Settings are stored per scene. They live in the **UV Gaps** tab of the UV Editor
 
 | Setting | Default | Description |
 |---|---|---|
-| Header checkbox | on | Show the gap overlay. |
+| Header checkbox | on | Show the gap overlay: the distances and every mark of this panel. |
 | Texture | 2048 | Texture resolution used to convert UV distances to pixels. Options: 256–8192, **Custom** (separate Width × Height; non-square textures are supported), or **Active Image** (the size of the image shown in this UV Editor, falling back to Width × Height when there is none). |
 | Points per Shell | 24 | Measurement points spread evenly along each shell's whole border, outer border and holes included. |
 | Shift Along Border | 0 % | Slides every point along the border. 0–100 % covers one full step between neighboring points, so sweeping the slider checks the entire border. |
@@ -177,13 +188,22 @@ Settings are stored per scene. They live in the **UV Gaps** tab of the UV Editor
 | Search Radius | 32 px | Only gaps up to this size are measured; shells farther apart are not treated as neighbors. Also decides which shells count as "near" a tile border. |
 | Selected Shells Only | off | Measure only from shells with at least one selected UV, as shown in the UV Editor (with UV Sync Selection on in 3.6–4.5: shells with a selected vertex). A stack counts as selected when one of its shells is. Distances still go to every shell. With UV Sync Selection off, Blender doesn't announce UV selection changes, so the add-on looks for them itself when the UV Editor redraws without panning or zooming, at most five times a second. |
 | Same Material Only | on | Measure gaps and find overlaps only between shells of the same material. Shells of other materials are ignored, including as obstacles between a shell and its tile border. |
+| Gaps: Show | on | Draw the distance lines and their pixel labels, between shells and to the tile border. Off, the other marks of this panel stay: overlaps, tile crossings, flipped, welded, no main in 0–1, under 1 px. The summary still counts the gaps. |
 | Flipped Shells: Show | on | Highlight mirrored shells. |
 | Flipped Shells: Select | — | Select all mirrored shells. See [Flipped shells](#flipped-shells). |
+| Welded Overlaps: Show | on | Draw the welded edges in red, tint what lies folded over and add **Welded overlap** to the shell's info block. |
+| Welded Overlaps: Select | — | Select the welded shells, whole. |
+| Welded Overlaps: Split | — | Split every welded shell, in every tile: what lies folded over moves by *Tiles* (Overlaps and Stacks) along U and is selected; the rest stays. See [Welded overlaps](#welded-overlaps). |
+| No Main in 0-1: Show | on | Tint and outline the shells outside the 0–1 tile that have no main there. See [No main in the 0–1 tile](#no-main). |
+| No Main in 0-1: Select | — | Select those shells. |
+| Under 1 px: Show | on | Outline and ring the shells less than one texture pixel wide or tall, at the *Texture* size. |
+| Under 1 px: Select | — | Select those shells. |
+| Outside 0-1 Tile: Select All | — | Select every shell lying outside the 0–1 tile (the middle of its bounds is outside). |
 | Refresh | — | Force a recompute. Normally not needed. |
 
-The summary box shows the number of shells and measured gaps, the stacks, overlapping shell pairs, gaps and tile-border distances below Minimal / Needed, shells crossing a tile border, and flipped shells.
+The summary box shows the number of shells and measured gaps, the stacks, overlapping shell pairs, gaps and tile-border distances below Minimal / Needed, shells crossing a tile border, flipped shells, welded overlaps (shells welded onto themselves), shells with no main in the 0–1 tile (`No main in the 0-1 tile: 3 (of 126 outside)`) and shells under 1 px.
 - `Flipped shells: 12 (9 in stacks)` means nine of them are mirrored copies lying in a stack with an unflipped shell. The warning icon shows only when a flipped shell is not in such a stack.
-- Under `Overlapping pairs`, a line like `0 of them in the 0-1 tile` appears when shells overlap in other tiles too, for example the copies moved there by *Move All but One*. It tells whether the 0–1 tile itself is clean.
+- Under `Overlapping pairs` and `Welded overlaps`, a line like `0 of them in the 0-1 tile` appears when shells overlap in other tiles too, for example the copies moved there by *Move All but One*. It tells whether the 0–1 tile itself is clean.
 
 ### Overlaps and Stacks (subpanel)
 
@@ -193,14 +213,14 @@ The summary box shows the number of shells and measured gaps, the stacks, overla
 | Stack Match | 99.9 % | How much two shells must cover each other to be a stack. Lower it when your copies are snapped less exactly; 100 % accepts only exact copies. |
 | Select: Overlapping | — | Selects the shells that overlap and are not a stack: copies that don't fit, shells lying partly on others. When a stack is involved, all its shells are selected. |
 | Select: Stacked | — | Selects every shell that lies in a stack. |
-| Select: All but One | — | Selects all the shells lying on others except one of every stack and overlap. See below for which one stays. |
+| Select: All but One | — | Selects all the shells lying on others except one of every stack and overlap, and of every welded shell, in every tile, the part lying folded over. See below for which one stays. |
 | Tiles | 1 | How many UDIM tiles along U *Move All but One* moves the shells. Negative values move to the left. |
-| Move All but One | — | Moves the shells *All but One* would select by *Tiles* tiles and selects them. |
-| Only in the 0-1 Tile | on | *All but One* (Select and Move) takes only shells lying in the 0–1 tile (UDIM 1001). Copies moved away earlier stay where they are, so pressing *Move All but One* twice changes nothing the second time. Off: the shells of every tile. |
+| Move All but One | — | Moves what *All but One* would select by *Tiles* tiles and selects it. Every welded shell, in every tile, is split: the part lying folded over (a mirrored half) moves, the rest stays, as if the Mirror modifier had had *Offset U* set to *Tiles*. |
+| Only in the 0-1 Tile | on | *All but One* (Select and Move) takes only the stacks and overlaps lying in the 0–1 tile (UDIM 1001). Copies moved away earlier stay where they are, so pressing *Move All but One* twice changes nothing the second time. Off: the shells of every tile. Welded shells are split in every tile either way. |
 
 Hold **Shift** while clicking a Select button to add to the selection. All of these can be undone, and their options can be changed afterwards in the redo panel.
 
-The box at the bottom counts the stacks and the shells lying on another one. When some of those lie outside the 0–1 tile, it also says how many are left in it: `0 of them in the 0-1 tile` after *Move All but One*. With a hundred or more overlapping pairs the box reminds you that copies placed less exactly need a lower *Stack Match*.
+The box at the bottom counts the stacks and the shells lying on another one. When some of those lie outside the 0–1 tile, it also says how many are left in it: `0 of them in the 0-1 tile` after *Move All but One*. With a hundred or more overlapping pairs the box reminds you that copies placed less exactly need a lower *Stack Match*. When there are welded shells, another box says that *All but One* takes what lies folded over in them, in every tile.
 
 ### UDIM Tile Borders (subpanel)
 
@@ -224,7 +244,7 @@ Applies to every label, info blocks included.
 
 ### Colors (subpanel, collapsed by default)
 
-*Touching (0 px)*, *At Minimal*, *At Needed*, *Overlap* and *Flipped* are all editable.
+*Touching (0 px)*, *At Minimal*, *At Needed*, *Overlap*, *Flipped*, *Welded* (red), *No Main in 0-1* (orange) and *Under 1 px* (cyan) are all editable.
 
 ### Materials panel
 
@@ -295,7 +315,7 @@ The **UV Gaps** tab of the 3D Viewport sidebar has the same texel density settin
 
 **Which UVs.** Exactly the faces the UV Editor shows. Hidden faces are ignored, and with UV Sync Selection off only faces selected in the mesh are included. All meshes in Edit Mode are measured together, each using its active UV map.
 
-**Shells.** Faces that share a UV vertex (the same mesh vertex with the same UV) belong to one shell. A shell's border is made of the UV edges used by only one face, ordered into continuous loops, holes included.
+**Shells.** Faces that share a UV vertex (the same mesh vertex with the same UV) belong to one shell. A shell's border is made of the UV edges used by only one face, ordered into continuous loops, holes included. A welded shell is measured as the layer it keeps: see [Welded overlaps](#welded-overlaps).
 
 **Points and gaps.** Points are spaced evenly by length along each shell's whole border. From each point, the add-on finds the closest point on another shell's border, measured in texture pixels, so non-square textures are handled correctly. Only neighbors in front of the border count, within about 75° of the direction the border faces. A measurement therefore never passes through the shell's own body or runs sideways along its edge. Neighbors beyond the Search Radius are ignored. Touching shells read **0.0 px**.
 
@@ -310,8 +330,9 @@ The **UV Gaps** tab of the 3D Viewport sidebar has the same texel density settin
 
 **All but One.** *Select All but One* and *Move All but One* leave one shell of every pile in place, so that afterwards nothing lies on anything else:
 - Of a stack, the shell standing for it stays and its copies go.
+- Of a welded shell, in any tile, the part lying folded over goes and the rest stays: the shell splits along its welded edges. See [Welded overlaps](#welded-overlaps).
 - Among shells that overlap without being a stack, shells are kept in this order: unflipped before flipped, then a stack before a single shell, then the larger one, then the first. A shell goes when it overlaps one that was already kept. A stack goes or stays as a whole.
-- With *Only in the 0-1 Tile*, only shells of that tile go.
+- With *Only in the 0-1 Tile*, only stacks and overlaps of that tile are thinned out; welded shells are split wherever they are.
 - *Move All but One* moves whole tiles along U, so the moved shells keep their place inside the tile and their texel density. It moves the shells as the UV Editor shows them: faces hidden there are not moved.
 - The buttons look at all shown shells, not only the selected ones, and follow *Same Material Only* and *Stack Match*.
 
@@ -322,10 +343,27 @@ The **UV Gaps** tab of the 3D Viewport sidebar has the same texel density settin
 
 Shells whose bounds span a tile line are reported as **Crosses tile** instead of being measured.
 
-<a id="flipped-shells"></a>**Flipped shells.** A shell is flipped when its total signed UV area is negative. Its faces run clockwise in UV space, which means the texture appears mirrored on the model.
+<a id="flipped-shells"></a>**Flipped shells.** A shell is flipped when its total signed UV area is negative. Its faces run clockwise in UV space, which means the texture appears mirrored on the model. A welded shell counts by the layer it keeps, so a mirrored half welded to its original doesn't make it flipped.
 - **Select** replaces the current selection. Enable *Extend* in the redo panel to add to it instead. The operation can be undone.
 - With UV Sync Selection on, it selects mesh faces.
 - With UV Sync Selection off, it selects UVs and leaves the mesh selection alone.
+
+<a id="welded-overlaps"></a>**Welded overlaps.** Two faces sharing a UV edge normally lie on either side of it. When both lie on the same side, the shell folds over onto itself there, and the faces beyond the fold lie on top of the others. A Mirror modifier does exactly this when it is applied with *Merge* on and no UV offset: the mirrored half gets the same UVs as the original, and its vertices on the mirror plane are merged with the original's. The two halves become one shell, welded along the seam and lying exactly on each other. Comparing shells can't find it, since there is only one shell, but for baking it is an overlap like any other: both halves bake into the same pixels.
+- Which side a face lies on: left of an edge it runs along forward when it winds counterclockwise in UV, right of it when it winds clockwise. How the faces are wound in 3D doesn't matter.
+- A face reaching less than 1e-6 UV away from the edge (zero UV area, rounding) has no side and never folds.
+- Cut along its welded edges, the shell falls into parts. Of parts joined by folds, one is the shell's own layer: the biggest by UV area, an unflipped one among parts of the same size. Of a mirrored half and its original, that is the original. The other parts lie folded over: they are tinted, and *All but One* takes them.
+- The shell is measured as that layer: the welded edges become part of its border, gaps are measured from them, and a shell lying on it is an overlap. Before 1.6, a shell lying inside a welded shell was not reported, and no gap was measured from the welded side.
+- *Split* and *Move All but One* move what lies folded over and split the shell along its welded edges, as if the Mirror modifier had had *Offset U* = 1: the original stays in the 0–1 tile and the mirrored half goes one tile over, flipped. A welded copy that *Move All but One* moves whole splits too: its mirrored half goes one tile further. A bake into the 0–1 tile then gets only the original, and with the image's *Extension* set to *Repeat* (the default of Blender's Image Texture node) the moved half shows the same texels.
+- A Mirror modifier on two axes leaves four quarters welded to each other: one stays and three go, one, two and three times *Tiles* along U. Parts that share a UV vertex never land in the same tile, so nothing stays welded or joined, and each quarter moved still matches the original (see [No main in the 0–1 tile](#no-main)).
+- *Select* (in the Welded Overlaps row) selects the welded shells whole; *Select: All but One* selects only what lies folded over.
+
+<a id="no-main"></a>**No main in the 0–1 tile.** A bake fills the 0–1 tile (UDIM 1001). A copy moved to another tile gets its texels from its original there, through a texture that repeats. So a shell outside the 0–1 tile needs a main: a shell of the 0–1 tile it lies on once moved back by whole tiles.
+- A shell lies outside the 0–1 tile when the middle of its bounds does, in any direction, U or V.
+- The main is found with the stack rules: it must cover the shell by at least *Stack Match* (also when *Stacked Shells as One* is off), mirrored copies count, and with *Same Material Only* it must have the same material.
+- A shell with no main is tinted orange: a stack moved out whole with its original, a part moved out by mistake, a copy edited after it was moved so that it no longer fits its original, an overlap moved out by *Move All but One* (it doesn't match the shell it lay on).
+- *Select All* in the *Outside 0-1 Tile* row selects every shell outside the 0–1 tile, main or not.
+
+**Under 1 px.** A shell's width and height in pixels are the extent of its bounds along U times the texture width, and along V times its height, at the *Texture* size. Under 1 in either, the shell gets at most a smear of one texel row or column. A shell collapsed onto a line or a point is 0 px. A thin shell lying diagonally can be more than a pixel along both U and V and is not reported.
 
 **Texel density.** For each shell, texel density = √(texture pixels the shell covers ÷ its surface area in square meters).
 - Pixels covered = UV area × Width × Height. For a non-square texture the result is the geometric mean of the horizontal and vertical density.
@@ -463,7 +501,7 @@ What stays on the CPU, and why:
 
 So the gains of 1.5.0 come from doing less work, not from moving work to the GPU: reading only what changed, measuring a stack once, measuring each material on its own, and avoiding slow library calls. On the scene above, the first display is about 10 times faster than in 1.4.0 and a selection click several hundred times. A change of graphics API would not have given that, because the time was not spent drawing.
 
-What a shader could still add: while you pan or zoom, the screen positions of all visible lines and markers are computed again in Python for every frame. A custom shader could keep them on the GPU and receive only the new view. Measured on the scene above with Blender 5.2 drawing for real (headless, with a software renderer), that is about 10 ms of the 15–25 ms a frame takes in Python; placing the labels, 7–8 ms, would stay. It is not part of 1.5.0.
+What a shader could still add: while you pan or zoom, the screen positions of all visible lines and markers are computed again in Python for every frame. A custom shader could keep them on the GPU and receive only the new view. Measured on the scene above with Blender 5.2 drawing for real (headless, with a software renderer), that is about 10 ms of the 15–25 ms a frame takes in Python; placing the labels, 7–8 ms, would stay. It is not part of the add-on.
 
 ---
 
@@ -472,12 +510,15 @@ What a shader could still add: while you pan or zoom, the screen positions of al
 - Gaps are sampled at the measurement points. A narrow spot between two points is found by adding points or sweeping *Shift Along Border*. Overlaps are always found.
 - Each point reports only its nearest neighbor.
 - UVs meant to wrap around (tiling textures) are not treated as wrapping. With Tile Borders on, every tile is a separate texture.
-- Flipped detection works per shell, based on its overall orientation. Individual folded faces inside an otherwise normal shell are not flagged.
+- Flipped detection works per shell, based on its overall orientation.
+- Welded overlaps are found where a shell folds over at a UV edge its faces share. Faces of one shell lying on each other without such an edge between them are not found: a face twisted in UV (its outline crossing itself), or a long shell bent around until its ends overlap. Neither is reported as an overlap between shells either, since it is one shell.
+- UVs count as welded when they agree to 1e-6. Faces whose shared corners were rounded differently, a little apart, are not welded at that edge.
+- *No main in 0-1* assumes the 0–1 tile is the one texture that gets baked. With a UDIM set of several baked tiles, every shell outside 1001 has no main there: turn *Show* off in that row.
 - Texel density is an average per shell. Stretching inside a shell, where one part is denser than another, is not shown.
 - Orientation arrows show a shell's average direction. On strongly curved shells, such as a cylinder unwrapped around its axis, the direction changes across the shell.
 - A shell whose faces use several materials counts as the material covering most of it.
 - Stacks are told by their borders, holes included. Two different parts with the same outline in the same place form a stack too; they do share that texture space. A part reused at another size or turned in UV space doesn't cover its original and is an overlap.
-- *Move All but One* moves shells by whole tiles along U from where they are. It doesn't look for an empty tile: shells already in the target tile get the moved ones on top.
+- *Move All but One* and *Split* move shells by whole tiles along U from where they are. They don't look for an empty tile: shells already in the target tile get the moved ones on top.
 - The copies moved away lie on each other in their new tile as they did before, and the overlay keeps counting them there as stacks and overlaps. The panels say how many are left in the 0–1 tile.
 - The Select and Move buttons work on the faces the UV Editor shows. With UV Sync Selection off those are the faces selected in the mesh: select all of the mesh first, or only the shown part of a shell is moved.
 - Without UV Sync Selection, hiding a material set deselects its faces in the mesh, because that is what the UV Editor shows. In vertex select mode a face whose corners are all shared with selected faces can come back after a later selection change.
@@ -488,6 +529,15 @@ What a shader could still add: while you pan or zoom, the screen positions of al
 ---
 
 ## Changelog
+
+**1.6.0**
+- Welded overlaps: shells welded onto themselves are found, though each is one shell. A Mirror modifier with *Merge* on leaves one when it is applied without a UV offset: the mirrored half lies on its original, welded to it along the seam. The welded edges are drawn thick and red, what lies folded over is tinted, and the shell's info block says **Welded overlap**. New row in the gaps panel: *Welded Overlaps*, Show and Select; a count in the summary; a *Welded* color.
+- *All but One* and *Move All but One* also split welded shells, in every tile: what lies folded over (the mirrored half) moves, the original stays, as with the Mirror modifier's *Offset U* set to 1. A *Split* button in the *Welded Overlaps* row does only that. Parts folded over more than once (a Mirror on two axes) go 2, 3… times *Tiles*, so that nothing stays welded.
+- No main in 0–1: shells outside the 0–1 tile with no shell there to take their texture from (a part moved out with all its copies) are tinted orange and counted. Buttons select them, or every shell outside the 0–1 tile.
+- Under 1 px: shells less than one texture pixel wide or tall are outlined and ringed, with their size in pixels.
+- *Gaps: Show* turns the distance lines and labels off without hiding the other marks.
+- A welded shell is measured as the layer it keeps. Before, a shell lying inside a welded shell was not reported as an overlap, no gap was measured from the welded side, and a welded shell could count as flipped or not by rounding.
+- Everything else computes exactly as in 1.5.0: compared value by value on 12 scenes, in Blender 4.2 to 5.3.
 
 **1.5.0**
 - Stacks: shells lying on each other on purpose, such as copies of a part or mirrored halves, are measured as one shell and are no longer reported as overlaps (*Stacked Shells as One*, *Stack Match*, 99.9 % by default). What is left as an overlap is what doesn't fit: careless copies, shells lying partly on others.
